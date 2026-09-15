@@ -1,0 +1,45 @@
+[package]
+name = "dsh-launch-console"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "DSH Launch Console: starts DSH in a hidden terminal and opens a locked-down browser window for the hardcoded DSH web UI"
+readme = "README.md"
+repository = "https://github.com/CosmoSail/DSH_Launch_Console"
+keywords = ["dsh", "webview", "launcher", "tao", "wry"]
+categories = ["gui", "command-line-utilities"]
+
+[dependencies]
+wry = "0.53"
+tao = "0.34"
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_Security",
+    "Win32_System_Console",
+    "Win32_System_DataExchange",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_JobObjects",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Memory",
+    "Win32_System_Ole",
+    "Win32_System_Threading",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+# WebView2 权限策略 / 壳内弹窗需要拿到 ICoreWebView2 等 COM 接口
+# （版本必须与 wry 0.53 使用的 webview2-com 一致）
+[target.'cfg(windows)'.dependencies]
+webview2-com = "0.38"
+
+[build-dependencies]
+winres = "0.1"
+
+[profile.release]
+strip = true
+opt-level = "z"
+lto = true

@@ -1,0 +1,21 @@
+# ── 默认：仓库内与检出都用 LF，避免跨平台换行差异 ──────────────
+* text=auto eol=lf
+
+# Windows 批处理必须 CRLF：cmd 对 LF-only 批处理的兼容性不佳
+*.bat   text eol=crlf
+
+# PowerShell 脚本：不做换行规范化。
+# 这些脚本用 here-string 生成 .cmd 文件，其中的换行符就是产物内容的一部分，
+# 一旦被 git 转换就会改变测试行为，因此保持字节原样。
+*.ps1   -text
+
+# ── 二进制资源：禁止任何转换 ──────────────────────────────────
+*.rgba  binary
+*.ico   binary
+*.exe   binary
+*.zip   binary
+*.gz    binary
+
+# ── GitHub 语言统计 ───────────────────────────────────────────
+# 测试脚本是开发工具，不计入项目主语言占比
+tests/*.ps1  linguist-documentation
