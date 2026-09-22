@@ -12,6 +12,7 @@
 # ── 二进制资源：禁止任何转换 ──────────────────────────────────
 *.rgba  binary
 *.ico   binary
+*.png   binary
 *.exe   binary
 *.zip   binary
 *.gz    binary

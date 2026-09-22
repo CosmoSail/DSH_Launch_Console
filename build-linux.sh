@@ -1,17 +1,21 @@
 #!/bin/sh
 # DSH Launch Console — Linux 构建与打包
 # 产出：target/release/dsh-launch-console 二进制
-#       Output/dsh-launch-console_0.1.0_amd64.deb 安装包
+#       Output/dsh-launch-console_0.2.0_amd64.deb 安装包
 set -e
 cd "$(dirname "$0")"
-VERSION=0.1.0
+VERSION=0.2.0
 
 # 1. 编译依赖（Debian/Ubuntu 系；其他发行版请自行安装等价包）
+# 0.2.0 起为原生 GUI（egui/wgpu），不再需要 webkit2gtk；
+# 需要 X11/Wayland 开发头与 OpenGL。
 if command -v apt-get >/dev/null 2>&1; then
   echo "==> 安装编译依赖（需要 sudo）"
   sudo apt-get update
   sudo apt-get install -y build-essential pkg-config \
-    libwebkit2gtk-4.1-dev libgtk-3-dev libxdo-dev libssl-dev curl
+    libx11-dev libxcursor-dev libxrandr-dev libxi-dev \
+    libxkbcommon-dev libwayland-dev libgl1-mesa-dev \
+    libssl-dev curl
 fi
 
 # 2. 编译
@@ -36,16 +40,16 @@ Version: $VERSION
 Section: utils
 Priority: optional
 Architecture: amd64
-Depends: libwebkit2gtk-4.1-0, libgtk-3-0
+Depends: libx11-6, libxkbcommon0, libgl1
 Maintainer: DSH
 Description: DSH Launch Console
- 只允许浏览 DSH 地址的微浏览器：隐藏启动 DSH，关窗同步结束终端。
+  DeepSeek Harness 启动器: native GUI for DSH start/stop/versions/plugins; Web UI opens in the system browser.
 EOF
 cat > "$DEBROOT/usr/share/applications/dsh-launch-console.desktop" <<EOF
 [Desktop Entry]
 Type=Application
 Name=DSH Launch Console
-Comment=DSH 微浏览器
+Comment=DeepSeek Harness 启动器
 Exec=dsh-launch-console
 Icon=dsh-launch-console
 Terminal=false

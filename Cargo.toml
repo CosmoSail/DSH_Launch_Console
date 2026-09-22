@@ -1,42 +1,61 @@
 [package]
 name = "dsh-launch-console"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 license = "MIT"
-description = "DSH Launch Console: starts DSH in a hidden terminal and opens a locked-down browser window for the hardcoded DSH web UI"
+description = "DSH Launch Console: a native GUI launcher that starts DeepSeek Harness with a hidden terminal, opens its Web UI in the system browser, and manages DSH versions and plugins"
 readme = "README.md"
 repository = "https://github.com/CosmoSail/DSH_Launch_Console"
-keywords = ["dsh", "webview", "launcher", "tao", "wry"]
+keywords = ["dsh", "launcher", "egui", "harness", "gui"]
 categories = ["gui", "command-line-utilities"]
 
 [dependencies]
-wry = "0.53"
-tao = "0.34"
+# 原生 GUI（纯 Rust 渲染，不依赖 WebView）
+# 渲染后端用 glow(OpenGL) 而非 wgpu：界面简单，glow 依赖更少、
+# 启动更快，且避开 wgpu-hal DX12 后端与 windows crate 的版本冲突。
+eframe = { version = "0.36", default-features = false, features = [
+    "default_fonts",
+    "glow",
+    "wayland",
+    "x11",
+] }
+egui = "0.36"
+egui_extras = "0.36"
+# 阻塞式 HTTP（版本检索 / 插件市场 / GitHub 搜索）
+ureq = { version = "3", features = ["json"] }
+# 原生文件选择框与消息框
+rfd = "0.17"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[target.'cfg(windows)'.dependencies]
+# 取窗口 HWND（托盘显示/隐藏窗口需要）；版本与 eframe 0.36 一致
+raw-window-handle = "0.6"
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
-    "Win32_Graphics_Gdi",
     "Win32_Security",
     "Win32_System_Console",
-    "Win32_System_DataExchange",
     "Win32_System_Diagnostics_ToolHelp",
     "Win32_System_JobObjects",
     "Win32_System_LibraryLoader",
-    "Win32_System_Memory",
-    "Win32_System_Ole",
     "Win32_System_Threading",
     "Win32_UI_Shell",
+    "Win32_UI_Shell_Common",
     "Win32_UI_WindowsAndMessaging",
 ] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+open = "5"
 
-# WebView2 权限策略 / 壳内弹窗需要拿到 ICoreWebView2 等 COM 接口
-# （版本必须与 wry 0.53 使用的 webview2-com 一致）
-[target.'cfg(windows)'.dependencies]
-webview2-com = "0.38"
+[dev-dependencies]
+# 只在单元测试里用：校验 cordis.patch.yml 改写后仍是合法 YAML。
+# 放到 dev-dependencies，发布版二进制不带它。
+serde_yaml = "0.9"
 
-[build-dependencies]
+# 只在 Windows 宿主上需要（给 exe 嵌图标与版本信息）。
+# 这样 Linux/macOS 本机编译时根本不会把它拉进构建图。
+[target.'cfg(windows)'.build-dependencies]
 winres = "0.1"
 
 [profile.release]

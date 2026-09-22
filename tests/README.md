@@ -43,21 +43,35 @@ Rust 侧的逻辑测试（URL 白名单、token 解析、shim 解析、日志轮
 
 ## 脚本一览
 
-| 脚本 | 验证内容 |
-| --- | --- |
-| `test-launch.ps1` | 启动链重构：直连包入口、失败分类、npx 回退三条路径 |
-| `test-fastpath.ps1` | 启动速度对比：旧版+npx / 新版+直连 `dsh` / 新版+npx 回退 |
-| `test-launch-ab.ps1` | A/B 对比：新直连链路 vs 旧"隐藏脚本 + shim"链路（各 4 轮取中位数） |
-| `test-window.ps1` | 窗口可见时间（进程启动 → 出现第一个可见顶层窗口） |
-| `test-loading.ps1` | 「窗口先显示 + 启动中页带秒数」：mock DSH 故意 10 秒后才给 token，第 5 秒截图 |
-| `probe-icon.ps1` | 像素级校验占位页：找出墨水像素并打印 ASCII 图（配合 `test-loading.ps1` 的截图） |
-| `test-attach.ps1` | 附加模式：DSH 已在运行时只开窗口、退出不杀它，并截图确认界面 |
-| `test-permission.ps1` | WebView2 对通知权限的默认处理（mock 页面回报 `Notification.permission`） |
-| `test-webview.ps1` | WebView 权限放行（通知/剪贴板）与同源弹窗的 cookie 共享 |
-| `test-name2.ps1` | 名称显示：托盘提示文案与托盘右键菜单项（UIA 读取真实菜单） |
-| `test-startup-timing.ps1` | **DSH 启动耗时对照**：node 直启 vs 经启动器，测到端口就绪的毫秒数 |
-| `test-startup-io-profile.ps1` | **启动画像**：采样 CPU 时间 / 读取字节 / 工作集，判断 CPU 受限还是 IO 受限 |
-| `test-startup-wait-diag.ps1` | **启动等待定位**：观测启动期间的 TCP 连接，确认是否阻塞在网络 |
+> ⚠️ **0.2.0 起界面改成了原生 egui、不再内置 WebView，也不再有 npx 回退**
+> （启动器直接 `node <入口> web …`）。下表「适用」一列标出每支脚本
+> 是否还对当前版本有意义；标 ❌ 的是 0.1.0 WebView 时代的产物，
+> 保留只为追溯当时的验证方式，跑它们会得到"功能不存在"的结论。
+
+| 脚本 | 验证内容 | 适用 0.2.0 |
+| --- | --- | --- |
+| `test-launch.ps1` | 启动链重构：直连包入口、失败分类、npx 回退三条路径 | ❌ npx 回退已不存在 |
+| `test-fastpath.ps1` | 启动速度对比：旧版+npx / 新版+直连 `dsh` / 新版+npx 回退 | ❌ 同上 |
+| `test-launch-ab.ps1` | A/B 对比：新直连链路 vs 旧"隐藏脚本 + shim"链路 | ❌ 对照对象已删除 |
+| `test-window.ps1` | 窗口可见时间（进程启动 → 出现第一个可见顶层窗口） | ⚠️ 思路仍可用，脚本内的基线 exe 名需更新 |
+| `test-loading.ps1` | 「窗口先显示 + 启动中页带秒数」：mock DSH 10 秒后才给 token，第 5 秒截图 | ❌ 占位页随 WebView 一起删除 |
+| `probe-icon.ps1` | 像素级校验占位页：找出墨水像素并打印 ASCII 图 | ❌ 同上 |
+| `test-attach.ps1` | 附加模式：DSH 已在运行时只开窗口、退出不杀它 | ✅ 行为仍在，但 0.2.0 是"只开浏览器标签" |
+| `test-permission.ps1` | WebView2 对通知权限的默认处理 | ❌ 无 WebView |
+| `test-webview.ps1` | WebView 权限放行与同源弹窗 cookie 共享 | ❌ 无 WebView |
+| `test-name2.ps1` | 名称显示：托盘提示文案与托盘右键菜单项 | ⚠️ 托盘菜单仍在，脚本里的旧进程名需更新 |
+| `test-startup-timing.ps1` | **DSH 启动耗时对照**：node 直启 vs 经启动器，测到端口就绪的毫秒数 | ✅ 结论仍成立 |
+| `test-startup-io-profile.ps1` | **启动画像**：采样 CPU 时间 / 读取字节 / 工作集 | ✅ |
+| `test-startup-wait-diag.ps1` | **启动等待定位**：观测启动期间的 TCP 连接 | ✅ |
+
+0.2.0 的端到端链路（启动 → 就绪 → token → 整树关闭）由程序自带的
+`--selftest` 覆盖，不依赖这里的脚本：
+
+```bat
+set DSH_LAUNCH_CONSOLE_URL=http://127.0.0.1:3199
+set DSH_HOME=%TEMP%\dsh-selftest-home
+DSH_Launch_Console.exe --selftest
+```
 
 ## 运行
 

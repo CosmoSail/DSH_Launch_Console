@@ -23,11 +23,15 @@ echo "安装位置：$INSTDIR"
 mkdir -p "$INSTDIR"
 
 # ============ 第二步：编译依赖（Debian/Ubuntu 系） ============
-if command -v apt-get >/dev/null 2>&1 && ! pkg-config --exists webkit2gtk-4.1; then
+# 0.2.0 起为原生 GUI（egui/glow），需要 X11/Wayland 开发头与 OpenGL，
+# 不再需要 webkit2gtk。
+if command -v apt-get >/dev/null 2>&1; then
   echo "==> 安装编译依赖（需要 sudo；其他发行版请自行安装等价包）"
   sudo apt-get update
   sudo apt-get install -y build-essential pkg-config \
-    libwebkit2gtk-4.1-dev libgtk-3-dev libxdo-dev libssl-dev curl
+    libx11-dev libxcursor-dev libxrandr-dev libxi-dev \
+    libxkbcommon-dev libwayland-dev libgl1-mesa-dev \
+    libssl-dev curl
 fi
 
 # ============ 第三步：编译，构建产物直接写入安装目录 ============
@@ -47,7 +51,7 @@ cat > "$HOME/.local/share/applications/dsh-launch-console.desktop" <<EOF
 [Desktop Entry]
 Type=Application
 Name=DSH Launch Console
-Comment=DSH 微浏览器
+Comment=DeepSeek Harness 启动器
 Exec="$INSTDIR/dsh-launch-console"
 Icon=dsh-launch-console
 Terminal=false
