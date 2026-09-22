@@ -22,8 +22,8 @@ fn embed_icon_and_version() {
     res.set("InternalName", "DSH_Launch_Console");
     res.set("CompanyName", "DSH Launch Console");
     res.set("LegalCopyright", "DSH Launch Console");
-    res.set("FileVersion", "0.2.0.0");
-    res.set("ProductVersion", "0.2.0.0");
+    res.set("FileVersion", "0.2.2.0");
+    res.set("ProductVersion", "0.2.2.0");
     res.compile().expect("embed icon resource");
 }
 

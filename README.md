@@ -16,7 +16,7 @@
 
 ## 下载安装
 
-**[⬇ 下载 DSH_Launch_Console-Setup-0.2.0.exe](https://github.com/CosmoSail/DSH_Launch_Console/releases/latest)**（Windows，5 MB）
+**[⬇ 下载 DSH_Launch_Console-Setup-0.2.2.exe](https://github.com/CosmoSail/DSH_Launch_Console/releases/latest)**（Windows，5 MB）
 
 双击安装即可 —— 按用户安装、**无需管理员权限**，带开始菜单与可选桌面快捷方式，可在「应用」里卸载。
 需要 **Node.js ≥ 18**；DSH 本体没装过也没关系，装好后在「版本」页点「安装」会自动替你装。
@@ -25,9 +25,9 @@
 
 | 文件 | 适用 | 用法 |
 | --- | --- | --- |
-| `DSH_Launch_Console-Setup-0.2.0.exe` | Windows | 双击安装（推荐） |
-| `DSH_Launch_Console-0.2.0-windows-src.zip` | Windows | 解压后双击 `安装.bat` 自行编译安装 |
-| `DSH_Launch_Console-0.2.0-linux.tar.gz` | Linux / macOS | 解压后 `./install.sh`，或 `./build-linux.sh` 打 .deb |
+| `DSH_Launch_Console-Setup-0.2.2.exe` | Windows | 双击安装（推荐） |
+| `DSH_Launch_Console-0.2.2-windows-src.zip` | Windows | 解压后双击 `安装.bat` 自行编译安装 |
+| `DSH_Launch_Console-0.2.2-linux.tar.gz` | Linux / macOS | 解压后 `./install.sh`，或 `./build-linux.sh` 打 .deb |
 
 > 0.2.0 起为原生 OpenGL 渲染，**不需要 WebView2 运行时**。
 
