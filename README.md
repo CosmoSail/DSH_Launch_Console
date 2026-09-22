@@ -14,10 +14,22 @@
 - **本程序**：只负责启动 / 关闭 DSH、在浏览器打开 Web UI、管版本与插件，**不自带 DSH**。
   没装过也没关系——在「版本」页点「安装」，它会替你执行 `npm i -g`。
 
-## 获取
+## 下载安装
 
-- **安装包**：Releases 里的 `DSH_Launch_Console-Setup-<版本>.exe`，双击安装（按用户安装，无需管理员）。
-- **源码**：clone 后跑 `安装.bat`（Windows）或 `./install.sh`（Linux、macOS），编译 + 安装一步到位。
+**[⬇ 下载 DSH_Launch_Console-Setup-0.2.0.exe](https://github.com/CosmoSail/DSH_Launch_Console/releases/latest)**（Windows，5 MB）
+
+双击安装即可 —— 按用户安装、**无需管理员权限**，带开始菜单与可选桌面快捷方式，可在「应用」里卸载。
+需要 **Node.js ≥ 18**；DSH 本体没装过也没关系，装好后在「版本」页点「安装」会自动替你装。
+
+也可以从 [Releases](https://github.com/CosmoSail/DSH_Launch_Console/releases) 拿源码包自行编译：
+
+| 文件 | 适用 | 用法 |
+| --- | --- | --- |
+| `DSH_Launch_Console-Setup-0.2.0.exe` | Windows | 双击安装（推荐） |
+| `DSH_Launch_Console-0.2.0-windows-src.zip` | Windows | 解压后双击 `安装.bat` 自行编译安装 |
+| `DSH_Launch_Console-0.2.0-linux.tar.gz` | Linux / macOS | 解压后 `./install.sh`，或 `./build-linux.sh` 打 .deb |
+
+> 0.2.0 起为原生 OpenGL 渲染，**不需要 WebView2 运行时**。
 
 ## 功能
 
