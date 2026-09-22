@@ -4,10 +4,14 @@
 //! + 中央内容区。所有耗时操作（npm 检索、插件市场、启动等待）都放后台线程，
 //! 结果经 channel 回主线程，UI 永不阻塞。
 
+use std::collections::BTreeMap;
 use std::sync::mpsc::{channel, Receiver, Sender};
+
+use crate::{tr, trf};
 
 use crate::config;
 use crate::dsh::{self, DshInstance};
+use crate::i18n::{self, Lang};
 use crate::icon;
 use crate::plugins::{self, InstalledPlugin, PluginInfo, PluginOrigin, PluginRoute};
 use crate::settings::{CloseAction, Settings, ThemeMode};
@@ -42,6 +46,8 @@ enum TaskResult {
     Versions(Result<VersionList, String>),
     Market(Result<Vec<PluginInfo>, String>),
     Github(Result<Vec<PluginInfo>, String>),
+    /// 已装插件的最新版本检查：(包名 → latest, 提示)
+    PluginLatest(BTreeMap<String, String>, Vec<String>),
     /// 通用操作结果：(标题, 结果)
     Op(String, Result<String, String>),
 }
@@ -115,6 +121,14 @@ pub struct App {
     plugin_scan: plugins::ScanReport,
     /// 已安装插件列表实测的每行高度（点）：用来把列表固定成"一屏 4 行"
     plugin_row_h: f32,
+    /// 后台查到的最新版本（包名 → latest）；没有的表示查不到（GitHub 装的/私有包）
+    plugin_updates: BTreeMap<String, String>,
+    /// 正在后台检查最新版本
+    update_checking: bool,
+    /// 本次运行是否已经跑过"自动更新"（避免反复重装）
+    auto_update_ran: bool,
+    /// 等用户确认的动作（更新插件 / 清除补丁条目）
+    pending_confirm: Option<ConfirmAction>,
     plugin_busy: Option<String>,
 
     /// 提示消息 (文本, 是否错误)
@@ -132,15 +146,16 @@ pub struct App {
 
 impl App {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        // 设置要最先读：风格决定后面整套配色的取值
+        // 设置要最先读：风格决定后面整套配色的取值，语言决定后面所有文案
         let settings = Settings::load();
         theme::set_dark(settings.theme == ThemeMode::Dark);
+        i18n::set(settings.language);
 
         let font = icon::install_cjk_font(&cc.egui_ctx);
         apply_theme(&cc.egui_ctx);
         let font_note = match &font {
-            Some(p) => format!("中文字体: {}", p),
-            None => "未找到系统中文字体，中文可能显示为方块".to_string(),
+            Some(p) => trf!("中文字体: {}", p),
+            None => tr!("未找到系统中文字体，中文可能显示为方块").to_string(),
         };
         config::log(&format!(
             "launcher started ({}); {}; {}",
@@ -186,6 +201,10 @@ impl App {
             github_loading: false,
             plugin_scan: plugins::ScanReport::default(),
             plugin_row_h: PLUGIN_ROW_H_FALLBACK,
+            plugin_updates: BTreeMap::new(),
+            update_checking: false,
+            auto_update_ran: false,
+            pending_confirm: None,
             plugin_busy: None,
             toast: None,
             last_output: None,
@@ -234,6 +253,7 @@ impl App {
     fn refresh_plugins(&mut self, ctx: &egui::Context) {
         self.rescan_plugins();
         self.reload_market(ctx);
+        self.check_plugin_updates(ctx);
     }
 
     /// 重新扫描已装插件。
@@ -247,6 +267,196 @@ impl App {
             config::log(&format!("plugin scan: {}", w));
         }
         self.plugin_scan = rep;
+    }
+
+    /// 后台检查已装插件在 npm 上的最新版本。
+    ///
+    /// 只查"用户装的、而且能定位到包目录"的那些（GitHub / 本地路径装的自然查不到，
+    /// 界面据此把「更新」置灰）。查完如果开着"自动更新"，会接着自动装一轮。
+    fn check_plugin_updates(&mut self, ctx: &egui::Context) {
+        if self.update_checking {
+            return;
+        }
+        let names: Vec<String> = self
+            .plugin_scan
+            .plugins
+            .iter()
+            .filter(|p| !p.patch_only && p.dir.is_some())
+            .map(|p| p.package.clone())
+            .collect();
+        if names.is_empty() {
+            self.plugin_updates.clear();
+            return;
+        }
+        self.update_checking = true;
+        self.tasks.spawn(ctx, move || {
+            let (found, notes) = plugins::fetch_latest(&names);
+            TaskResult::PluginLatest(found, notes)
+        });
+    }
+
+    /// 有新版可更新的插件：(包名, 最新版本)。
+    fn outdated(&self) -> Vec<(String, String)> {
+        self.plugin_scan
+            .plugins
+            .iter()
+            .filter_map(|p| {
+                let latest = self.plugin_updates.get(&p.package)?;
+                plugins::is_newer(latest, &p.version).then(|| (p.package.clone(), latest.clone()))
+            })
+            .collect()
+    }
+
+    /// 开了"自动更新"就把能更新的都装到最新版（每次运行最多自动跑一轮）。
+    fn maybe_auto_update(&mut self, ctx: &egui::Context) {
+        if !self.settings.auto_update_plugins || self.auto_update_ran || self.plugin_busy.is_some() {
+            return;
+        }
+        let targets = self.outdated();
+        if targets.is_empty() {
+            return;
+        }
+        self.auto_update_ran = true;
+        let profile = self.profile();
+        self.plugin_busy = Some(trf!("正在自动更新 {} 个插件…", targets.len()));
+        config::log(&format!(
+            "auto-updating {} plugin(s): {}",
+            targets.len(),
+            targets.iter().map(|(n, v)| format!("{}@{}", n, v)).collect::<Vec<_>>().join(", ")
+        ));
+        self.tasks.spawn(ctx, move || {
+            let mut ok: Vec<String> = Vec::new();
+            let mut bad: Vec<String> = Vec::new();
+            for (name, latest) in &targets {
+                match plugins::update_to_latest(&profile, name) {
+                    Ok(_) => {
+                        let actual = plugins::installed_version(&profile, name)
+                            .unwrap_or_else(|| tr!("未知").to_string());
+                        ok.push(format!("{} {} → {}", name, latest, actual));
+                    }
+                    Err(e) => bad.push(format!("{}：{}", name, e)),
+                }
+            }
+            let mut text = String::new();
+            if !ok.is_empty() {
+                text.push_str(&trf!("已更新：\n  {}\n", ok.join("\n  ")));
+            }
+            if !bad.is_empty() {
+                text.push_str(&trf!("失败：\n  {}\n", bad.join("\n  ")));
+            }
+            if bad.is_empty() {
+                TaskResult::Op(trf!("已自动更新 {} 个插件", ok.len()), Ok(text))
+            } else {
+                TaskResult::Op(
+                    trf!("自动更新：{} 个成功、{} 个失败", ok.len(), bad.len()),
+                    Err(text),
+                )
+            }
+        });
+    }
+
+    /// 手动更新一个插件到最新版（后台跑 pnpm）。
+    fn update_plugin(&mut self, ctx: &egui::Context, package: String, latest: Option<String>) {
+        if self.plugin_busy.is_some() {
+            return;
+        }
+        self.plugin_busy = Some(trf!("正在把 {} 更新到最新版…", package));
+        let profile = self.profile();
+        let label = package.clone();
+        self.tasks.spawn(ctx, move || match plugins::update_to_latest(&profile, &package) {
+            Ok(text) => {
+                // 报告**磁盘上实际装到的版本**：npm 的 latest 与 pnpm 落盘的版本
+                // 可能差一档（pnpm 有最小发布年龄策略）
+                let actual = plugins::installed_version(&profile, &package);
+                let tail = match (&actual, &latest) {
+                    (Some(got), Some(want)) if got != want => {
+                        trf!("（实际装到 {}，npm 的 latest 是 {}）", got, want)
+                    }
+                    (Some(got), _) => format!("（{}）", got),
+                    (None, Some(want)) => trf!("（目标 {}）", want),
+                    (None, None) => String::new(),
+                };
+                TaskResult::Op(trf!("{} 已更新到最新版{}", label, tail), Ok(text))
+            }
+            Err(e) => TaskResult::Op(trf!("更新 {} 失败", label), Err(e)),
+        });
+    }
+
+    /// 清除补丁里的某个条目（本地改写，写完立刻重扫）。
+    fn clear_patch_entry(&mut self, id: String) {
+        let profile = self.profile();
+        match plugins::clear_patch_entry(&profile, &id) {
+            Ok(()) => {
+                self.rescan_plugins();
+                self.toast = Some((trf!("已清除补丁条目 {}", id), false));
+            }
+            Err(e) => self.toast = Some((e, true)),
+        }
+    }
+
+    /// 插件行动作的分发。
+    ///
+    /// 「更新」在**自动更新关着**的时候要先确认（设置里那句"需要用户确认后才能更新"）；
+    /// 开着就直接装——那是用户自己选的"自动"。「清除补丁条目」是改配置文件，一律先确认。
+    fn run_installed_action(&mut self, ctx: &egui::Context, a: InstalledAction) {
+        match a {
+            InstalledAction::None => {}
+            InstalledAction::Uninstall(pkg) => self.uninstall_plugin(ctx, pkg),
+            InstalledAction::Toggle { label, ids, enabled } => {
+                self.toggle_plugin(ctx, label, ids, enabled)
+            }
+            InstalledAction::Update { package, latest } => {
+                if self.settings.auto_update_plugins {
+                    self.update_plugin(ctx, package, latest);
+                } else {
+                    self.pending_confirm = Some(ConfirmAction::Update { package, latest });
+                }
+            }
+            InstalledAction::ClearPatch(id) => {
+                self.pending_confirm = Some(ConfirmAction::ClearPatch { id });
+            }
+        }
+    }
+
+    /// 待确认条：写在配置/装包之前问一句（确认 / 取消）。
+    fn confirm_bar(&mut self, ui: &mut egui::Ui) {
+        let Some(c) = self.pending_confirm.clone() else {
+            return;
+        };
+        let ctx = ui.ctx().clone();
+        egui::Frame::NONE
+            .fill(theme::warn_soft())
+            .corner_radius(8.0)
+            .inner_margin(egui::Margin::symmetric(12, 8))
+            .stroke(egui::Stroke::new(1.0, theme::warn().gamma_multiply(0.4)))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new(c.question()).size(13.0).color(theme::text()));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button(tr!("取消")).clicked() {
+                            self.pending_confirm = None;
+                        }
+                        let ok = egui::Button::new(
+                            egui::RichText::new(c.ok_label())
+                                .size(13.5)
+                                .color(egui::Color32::WHITE),
+                        )
+                        .fill(theme::accent_solid())
+                        .stroke(egui::Stroke::NONE);
+                        if ui.add(ok).clicked() {
+                            self.pending_confirm = None;
+                            match c.clone() {
+                                ConfirmAction::Update { package, latest } => {
+                                    self.update_plugin(&ctx, package, latest)
+                                }
+                                ConfirmAction::ClearPatch { id } => self.clear_patch_entry(id),
+                            }
+                        }
+                    });
+                });
+            });
+        ui.add_space(8.0);
     }
 
     /// 重新抓插件市场（后台线程，旧列表先留在界面上，抓回来再替换）。
@@ -281,7 +491,7 @@ impl App {
             }
             match webui::open_web_ui(&self.settings.url, self.token.as_deref()) {
                 Ok(()) => {
-                    self.toast = Some(("已在系统浏览器中新开一个 Web UI".into(), false))
+                    self.toast = Some((tr!("已在系统浏览器中新开一个 Web UI").into(), false))
                 }
                 Err(e) => self.toast = Some((e, true)),
             }
@@ -305,7 +515,7 @@ impl App {
                 self.phase = DshPhase::Starting;
                 self.boot_deadline =
                     Some(std::time::Instant::now() + std::time::Duration::from_secs(180));
-                self.toast = Some(("正在启动 DeepSeek Harness…".into(), false));
+                self.toast = Some((tr!("正在启动 DeepSeek Harness…").into(), false));
             }
             Err(msg) => {
                 self.phase = DshPhase::Failed(msg.clone());
@@ -324,13 +534,13 @@ impl App {
         self.token = None;
         self.running_since = None;
         self.boot_deadline = None;
-        self.toast = Some(("已关闭 DeepSeek Harness".into(), false));
+        self.toast = Some((tr!("已关闭 DeepSeek Harness").into(), false));
     }
 
     /// 打开 Web UI。
     fn open_web_ui(&mut self) {
         match webui::open_web_ui(&self.settings.url, self.token.as_deref()) {
-            Ok(()) => self.toast = Some(("已在系统浏览器中打开 Web UI".into(), false)),
+            Ok(()) => self.toast = Some((tr!("已在系统浏览器中打开 Web UI").into(), false)),
             Err(e) => self.toast = Some((e, true)),
         }
     }
@@ -349,10 +559,10 @@ impl App {
             let text = lines.join("\n");
             match r {
                 Ok(spec) => TaskResult::Op(
-                    format!("全局安装已是 {}", v),
-                    Ok(format!("{}\n\n已执行: npm i -g {}", text, spec)),
+                    trf!("全局安装已是 {}", v),
+                    Ok(trf!("{}\n\n已执行: npm i -g {}", text, spec)),
                 ),
-                Err(e) => TaskResult::Op(format!("切换 {} 失败", v), Err(format!("{}\n{}", text, e))),
+                Err(e) => TaskResult::Op(trf!("切换 {} 失败", v), Err(format!("{}\n{}", text, e))),
             }
         });
     }
@@ -361,28 +571,28 @@ impl App {
     fn install_plugin(&mut self, ctx: &egui::Context, p: PluginInfo) {
         let spec = if !p.npm.is_empty() { p.npm.clone() } else { p.install.clone() };
         if spec.is_empty() {
-            self.toast = Some(("该插件没有可用的安装标识".into(), true));
+            self.toast = Some((tr!("该插件没有可用的安装标识").into(), true));
             return;
         }
-        self.plugin_busy = Some(format!("正在安装 {} …", p.name));
+        self.plugin_busy = Some(trf!("正在安装 {} …", p.name));
         let profile = self.profile();
         let label = p.name.clone();
         self.tasks.spawn(ctx, move || {
             match plugins::install(&profile, &spec) {
-                Ok(text) => TaskResult::Op(format!("已安装 {}", label), Ok(text)),
-                Err(e) => TaskResult::Op(format!("安装 {} 失败", label), Err(e)),
+                Ok(text) => TaskResult::Op(trf!("已安装 {}", label), Ok(text)),
+                Err(e) => TaskResult::Op(trf!("安装 {} 失败", label), Err(e)),
             }
         });
     }
 
     /// 插件：卸载。
     fn uninstall_plugin(&mut self, ctx: &egui::Context, package: String) {
-        self.plugin_busy = Some(format!("正在卸载 {} …", package));
+        self.plugin_busy = Some(trf!("正在卸载 {} …", package));
         let profile = self.profile();
         let label = package.clone();
         self.tasks.spawn(ctx, move || match plugins::uninstall(&profile, &package) {
-            Ok(text) => TaskResult::Op(format!("已卸载 {}", label), Ok(text)),
-            Err(e) => TaskResult::Op(format!("卸载 {} 失败", label), Err(e)),
+            Ok(text) => TaskResult::Op(trf!("已卸载 {}", label), Ok(text)),
+            Err(e) => TaskResult::Op(trf!("卸载 {} 失败", label), Err(e)),
         });
     }
 
@@ -393,7 +603,7 @@ impl App {
             Ok(()) => {
                 self.rescan_plugins();
                 self.toast = Some((
-                    format!("{} 已{}", label, if enabled { "启用" } else { "禁用" }),
+                    trf!("{} 已{}", label, if enabled { "启用" } else { "禁用" }),
                     false,
                 ));
                 let _ = ctx;
@@ -442,7 +652,7 @@ impl App {
                 }
                 TaskResult::Versions(Err(e)) => {
                     if !self.versions_fetched {
-                        self.toast = Some((format!("版本列表获取失败：{}", e), true));
+                        self.toast = Some((trf!("版本列表获取失败：{}", e), true));
                     }
                 }
                 TaskResult::Market(Ok(list)) => {
@@ -452,7 +662,7 @@ impl App {
                 }
                 TaskResult::Market(Err(e)) => {
                     self.market_loading = false;
-                    self.toast = Some((format!("插件市场加载失败：{}", e), true));
+                    self.toast = Some((trf!("插件市场加载失败：{}", e), true));
                 }
                 TaskResult::Github(Ok(list)) => {
                     self.github_results = list;
@@ -460,7 +670,15 @@ impl App {
                 }
                 TaskResult::Github(Err(e)) => {
                     self.github_loading = false;
-                    self.toast = Some((format!("GitHub 搜索失败：{}", e), true));
+                    self.toast = Some((trf!("GitHub 搜索失败：{}", e), true));
+                }
+                TaskResult::PluginLatest(found, notes) => {
+                    self.plugin_updates = found;
+                    self.update_checking = false;
+                    for n in &notes {
+                        config::log(&format!("plugin update check: {}", n));
+                    }
+                    self.maybe_auto_update(ctx);
                 }
                 TaskResult::Op(title, res) => {
                     self.installing = None;
@@ -477,6 +695,8 @@ impl App {
                     }
                     self.installed = versions::installed();
                     self.rescan_plugins();
+                    // 装/卸/更新之后重新看一眼最新版本（自动更新也在这里被触发）
+                    self.check_plugin_updates(ctx);
                 }
             }
         }
@@ -506,7 +726,7 @@ impl App {
                         self.instance = None;
                         self.phase = DshPhase::Stopped;
                         self.running_since = None;
-                        self.toast = Some((format!("DSH 已退出（退出码 {}）", code), true));
+                        self.toast = Some((trf!("DSH 已退出（退出码 {}）", code), true));
                     }
                 }
             }
@@ -526,7 +746,7 @@ impl App {
                 "DSH web UI is up (token: {})",
                 if self.token.is_some() { "got" } else { "pending" }
             ));
-            self.toast = Some(("DeepSeek Harness 已启动".into(), false));
+            self.toast = Some((tr!("DeepSeek Harness 已启动").into(), false));
             if self.settings.auto_open_browser {
                 let _ = webui::open_web_ui(&self.settings.url, self.token.as_deref());
             }
@@ -539,13 +759,10 @@ impl App {
                 let tail = dsh::log_tail(20);
                 config::log(&format!("DSH exited early with code {}", code));
                 self.instance = None;
-                let msg = format!(
-                    "DSH 启动失败（退出码 {}）。\n最近输出：\n{}",
-                    code,
-                    if tail.is_empty() { "（无）".to_string() } else { tail }
-                );
+                let msg = trf!("DSH 启动失败（退出码 {}）。\n最近输出：\n{}", code,
+                    if tail.is_empty() { "（无）".to_string() } else { tail });
                 self.phase = DshPhase::Failed(msg.clone());
-                self.toast = Some(("DSH 启动失败".into(), true));
+                self.toast = Some((tr!("DSH 启动失败").into(), true));
                 self.last_output = Some(msg);
                 return;
             }
@@ -555,8 +772,8 @@ impl App {
         if let Some(dl) = self.boot_deadline {
             if std::time::Instant::now() >= dl {
                 self.stop_dsh();
-                self.phase = DshPhase::Failed("DSH 在 180 秒内未就绪".into());
-                self.toast = Some(("DSH 启动超时".into(), true));
+                self.phase = DshPhase::Failed(tr!("DSH 在 180 秒内未就绪").into());
+                self.toast = Some((tr!("DSH 启动超时").into(), true));
             }
         }
     }
@@ -859,17 +1076,17 @@ impl App {
                                 .color(theme::text()),
                         );
                         ui.label(
-                            egui::RichText::new("DeepSeek Harness 启动器")
+                            egui::RichText::new(tr!("DeepSeek Harness 启动器"))
                                 .size(12.5)
                                 .color(theme::dim()),
                         );
                     });
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         let (fg, bg, label) = match &self.phase {
-                            DshPhase::Running => (theme::ok(), theme::ok_soft(), "运行中"),
-                            DshPhase::Starting => (theme::warn(), theme::warn_soft(), "启动中…"),
-                            DshPhase::Stopped => (theme::dim(), theme::surface(), "未启动"),
-                            DshPhase::Failed(_) => (theme::err(), theme::err_soft(), "启动失败"),
+                            DshPhase::Running => (theme::ok(), theme::ok_soft(), tr!("运行中")),
+                            DshPhase::Starting => (theme::warn(), theme::warn_soft(), tr!("启动中…")),
+                            DshPhase::Stopped => (theme::dim(), theme::surface(), tr!("未启动")),
+                            DshPhase::Failed(_) => (theme::err(), theme::err_soft(), tr!("启动失败")),
                         };
                         status_chip(ui, label, fg, bg);
                     });
@@ -885,10 +1102,10 @@ impl App {
     fn sidebar(&mut self, ui: &mut egui::Ui) {
         ui.add_space(4.0);
         let items = [
-            (Tab::Console, "控制台", "启动 / 关闭"),
-            (Tab::Versions, "版本", "安装与切换"),
-            (Tab::Plugins, "插件", "搜索与管理"),
-            (Tab::Settings, "设置", "服务与行为"),
+            (Tab::Console, tr!("控制台"), tr!("启动 / 关闭")),
+            (Tab::Versions, tr!("版本"), tr!("安装与切换")),
+            (Tab::Plugins, tr!("插件"), tr!("搜索与管理")),
+            (Tab::Settings, tr!("设置"), tr!("服务与行为")),
         ];
         for (tab, name, hint) in items {
             let selected = self.tab == tab;
@@ -946,10 +1163,10 @@ impl App {
     // ------------------------------------------------------ 控制台
 
     fn tab_console(&mut self, ui: &mut egui::Ui) {
-        ui.heading(egui::RichText::new("控制台").size(21.0).color(theme::text()));
+        ui.heading(egui::RichText::new(tr!("控制台")).size(21.0).color(theme::text()));
         ui.add_space(2.0);
         ui.label(
-            egui::RichText::new("启动或关闭 DeepSeek Harness，界面在系统默认浏览器中打开")
+            egui::RichText::new(tr!("启动或关闭 DeepSeek Harness，界面在系统默认浏览器中打开"))
                 .size(13.0)
                 .color(theme::dim()),
         );
@@ -959,10 +1176,10 @@ impl App {
         card(ui, |ui| {
             ui.horizontal(|ui| {
                 let (dot, text) = match &self.phase {
-                    DshPhase::Running => (theme::ok(), "DeepSeek Harness 正在运行".to_string()),
-                    DshPhase::Starting => (theme::warn(), "正在启动 DeepSeek Harness…".to_string()),
-                    DshPhase::Stopped => (theme::dim(), "DeepSeek Harness 未启动".to_string()),
-                    DshPhase::Failed(_) => (theme::err(), "启动失败".to_string()),
+                    DshPhase::Running => (theme::ok(), tr!("DeepSeek Harness 正在运行").to_string()),
+                    DshPhase::Starting => (theme::warn(), tr!("正在启动 DeepSeek Harness…").to_string()),
+                    DshPhase::Stopped => (theme::dim(), tr!("DeepSeek Harness 未启动").to_string()),
+                    DshPhase::Failed(_) => (theme::err(), tr!("启动失败").to_string()),
                 };
                 let (r, _) = ui.allocate_exact_size(egui::vec2(12.0, 12.0), egui::Sense::hover());
                 ui.painter().circle_filled(r.center(), 6.0, dot);
@@ -973,10 +1190,7 @@ impl App {
                     let s = since.elapsed().as_secs();
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.label(
-                            egui::RichText::new(format!(
-                                "已运行 {}",
-                                fmt_dur(s)
-                            ))
+                            egui::RichText::new(trf!("已运行 {}", fmt_dur(s)))
                             .size(13.0)
                             .color(theme::dim()),
                         );
@@ -987,12 +1201,9 @@ impl App {
             let (host, port) = self.settings.host_port();
             ui.add_space(6.0);
             ui.label(
-                egui::RichText::new(format!(
-                    "地址  {}      端口 {}      profile {}",
-                    host,
+                egui::RichText::new(trf!("地址  {}      端口 {}      profile {}", host,
                     port,
-                    self.profile()
-                ))
+                    self.profile()))
                 .size(12.5)
                 .color(theme::dim()),
             );
@@ -1007,7 +1218,7 @@ impl App {
                 // 启动 / 关闭 —— 专用按键
                 // 运行中仍然可点：点了 = 在浏览器新开一个 Web UI，不会重复起服务
                 let start_btn = egui::Button::new(
-                    egui::RichText::new("▶  启动 DeepSeek Harness")
+                    egui::RichText::new(tr!("▶  启动 DeepSeek Harness"))
                         .size(15.0)
                         .strong()
                         .color(if starting { theme::dim() } else { egui::Color32::WHITE }),
@@ -1029,7 +1240,7 @@ impl App {
                 ui.add_space(8.0);
 
                 let stop_btn = egui::Button::new(
-                    egui::RichText::new("■  关闭 DeepSeek Harness")
+                    egui::RichText::new(tr!("■  关闭 DeepSeek Harness"))
                         .size(15.0)
                         .strong()
                         .color(if stoppable { egui::Color32::WHITE } else { theme::dim() }),
@@ -1048,7 +1259,7 @@ impl App {
             // 打开 Web UI
             let live = matches!(self.phase, DshPhase::Running);
             let open_btn = egui::Button::new(
-                egui::RichText::new("🌐  在浏览器中打开 Web UI")
+                egui::RichText::new(tr!("🌐  在浏览器中打开 Web UI"))
                     .size(15.0)
                     .strong()
                     .color(if live { egui::Color32::WHITE } else { theme::dim() }),
@@ -1064,7 +1275,7 @@ impl App {
                 ui.add_space(6.0);
                 ui.label(
                     egui::RichText::new(
-                        "注意：当前 DSH 不是本启动器启动的，为避免误杀，启动器不会结束它（也不会随启动器退出而被关闭）。",
+                        tr!("注意：当前 DSH 不是本启动器启动的，为避免误杀，启动器不会结束它（也不会随启动器退出而被关闭）。"),
                     )
                     .size(12.0)
                     .color(theme::warn()),
@@ -1077,7 +1288,7 @@ impl App {
         // —— 失败 / 日志 ——
         if let DshPhase::Failed(msg) = self.phase.clone() {
             card_err(ui, |ui| {
-                ui.label(egui::RichText::new("启动失败").size(15.0).strong().color(theme::err()));
+                ui.label(egui::RichText::new(tr!("启动失败")).size(15.0).strong().color(theme::err()));
                 ui.add_space(4.0);
                 ui.label(egui::RichText::new(&msg).size(12.5).color(theme::text()));
             });
@@ -1086,7 +1297,7 @@ impl App {
 
         card(ui, |ui| {
             egui::CollapsingHeader::new(
-                egui::RichText::new("运行日志").size(15.0).color(theme::text()),
+                egui::RichText::new(tr!("运行日志")).size(15.0).color(theme::text()),
             )
             .default_open(false)
             .show(ui, |ui| {
@@ -1098,7 +1309,7 @@ impl App {
 
                 if let Some(out) = &self.last_output {
                     ui.add_space(8.0);
-                    ui.label(egui::RichText::new("最近操作输出").size(13.5).color(theme::dim()));
+                    ui.label(egui::RichText::new(tr!("最近操作输出")).size(13.5).color(theme::dim()));
                     log_view(ui, out, 180.0);
                 }
             });
@@ -1109,13 +1320,13 @@ impl App {
 
     fn tab_versions(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            ui.heading(egui::RichText::new("版本管理").size(21.0).color(theme::text()));
+            ui.heading(egui::RichText::new(tr!("版本管理")).size(21.0).color(theme::text()));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.button("刷新").clicked() {
+                if ui.button(tr!("刷新")).clicked() {
                     self.refresh_versions(ui.ctx());
                 }
                 ui.add_space(6.0);
-                if ui.button("源码仓库").clicked() {
+                if ui.button(tr!("源码仓库")).clicked() {
                     if let Err(e) = webui::open_url(config::DSH_REPO) {
                         self.toast = Some((e, true));
                     }
@@ -1125,7 +1336,7 @@ impl App {
         ui.add_space(2.0);
         ui.label(
             egui::RichText::new(
-                "自动从 npm 检索 @deepseek-ai/dsh 的全部版本（与 GitHub 源码仓库同一来源）。在这里安装 = 直接切换全局安装：npm i -g @deepseek-ai/dsh@<版本>。",
+                tr!("自动从 npm 检索 @deepseek-ai/dsh 的全部版本（与 GitHub 源码仓库同一来源）。在这里安装 = 直接切换全局安装：npm i -g @deepseek-ai/dsh@<版本>。"),
             )
             .size(13.0)
             .color(theme::dim()),
@@ -1135,11 +1346,11 @@ impl App {
         // 全局安装（DSH 只有这一份）
         card(ui, |ui| {
             ui.horizontal(|ui| {
-                ui.label(egui::RichText::new("全局安装").size(14.0).color(theme::dim()));
+                ui.label(egui::RichText::new(tr!("全局安装")).size(14.0).color(theme::dim()));
                 ui.add_space(8.0);
                 let cur = match &self.installed.global {
                     Some(g) => g.clone(),
-                    None => "（未检测到）".to_string(),
+                    None => tr!("（未检测到）").to_string(),
                 };
                 let col = if self.installed.global.is_some() { theme::ok() } else { theme::warn() };
                 ui.label(egui::RichText::new(cur).size(14.0).strong().color(col));
@@ -1149,7 +1360,7 @@ impl App {
                 ui.add_space(2.0);
                 ui.label(
                     egui::RichText::new(
-                        "还没检测到全局安装。可以在下面选一个版本点「安装」，或手动执行 npm i -g @deepseek-ai/dsh。",
+                        tr!("还没检测到全局安装。可以在下面选一个版本点「安装」，或手动执行 npm i -g @deepseek-ai/dsh。"),
                     )
                     .size(12.0)
                     .color(theme::warn()),
@@ -1159,7 +1370,7 @@ impl App {
                 ui.add_space(2.0);
                 ui.label(
                     egui::RichText::new(
-                        "注意：DSH 正在运行（由本启动器启动）。切换版本会覆盖全局安装里的文件，Windows 上可能因文件占用失败——建议先在「控制台」关闭它。",
+                        tr!("注意：DSH 正在运行（由本启动器启动）。切换版本会覆盖全局安装里的文件，Windows 上可能因文件占用失败——建议先在「控制台」关闭它。"),
                     )
                     .size(12.0)
                     .color(theme::warn()),
@@ -1171,12 +1382,12 @@ impl App {
 
         // 可选版本
         ui.horizontal(|ui| {
-            ui.label(egui::RichText::new("可选版本").size(14.0).strong().color(theme::text()));
+            ui.label(egui::RichText::new(tr!("可选版本")).size(14.0).strong().color(theme::text()));
             if let Some(t) = &self.installing {
                 ui.add_space(8.0);
                 ui.spinner();
                 ui.label(
-                    egui::RichText::new(format!("正在把全局安装切换为 {} …", t))
+                    egui::RichText::new(trf!("正在把全局安装切换为 {} …", t))
                         .size(12.5)
                         .color(theme::warn()),
                 );
@@ -1187,7 +1398,7 @@ impl App {
         if self.versions.versions.is_empty() {
             ui.horizontal(|ui| {
                 ui.spinner();
-                ui.label(egui::RichText::new("正在获取版本列表…").size(13.0).color(theme::dim()));
+                ui.label(egui::RichText::new(tr!("正在获取版本列表…")).size(13.0).color(theme::dim()));
             });
             return;
         }
@@ -1228,11 +1439,11 @@ impl App {
                                 |ui| {
                                     if active {
                                         ui.label(
-                                            egui::RichText::new("使用中").size(12.5).color(theme::ok()),
+                                            egui::RichText::new(tr!("使用中")).size(12.5).color(theme::ok()),
                                         );
                                     } else {
                                         // 已有全局安装时是「切换」，没有时是「安装」——动作一样
-                                        let label = if has_any { "切换" } else { "安装" };
+                                        let label = if has_any { tr!("切换") } else { tr!("安装") };
                                         if ui
                                             .add_enabled(
                                                 self.installing.is_none(),
@@ -1256,25 +1467,29 @@ impl App {
 
     fn tab_plugins(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            ui.heading(egui::RichText::new("插件管理").size(21.0).color(theme::text()));
+            ui.heading(egui::RichText::new(tr!("插件管理")).size(21.0).color(theme::text()));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                // 刷新：本地重扫（瞬时）+ 后台重抓市场（旧列表先留着）
+                // 刷新：本地重扫（瞬时）+ 后台重查最新版本 + 后台重抓市场（旧列表先留着）
                 if ui
-                    .button(egui::RichText::new("⟳  刷新").size(14.0))
+                    .button(egui::RichText::new(tr!("⟳  刷新")).size(14.0))
                     .on_hover_text(
-                        "重新扫描已装插件（profile 依赖 / bundle 层 / node_modules / pnpm 存储 / \
-                         兜底目录 / 共享目录 / dsh 自带 / 补丁条目），并重新抓取插件市场",
+                        tr!("重新扫描已装插件（profile 依赖 / bundle 层 / node_modules / pnpm 存储 / \
+                         兜底目录 / 共享目录 / dsh 自带 / 补丁条目）、重新检查它们的最新版本，\
+                         并重新抓取插件市场"),
                     )
                     .clicked()
                 {
                     self.rescan_plugins();
+                    // 重扫之后包目录/版本可能变了，最新版本也要重查一遍：
+                    // 查到新版就点亮「更新」，开着"自动更新"的话会顺带自动装掉
+                    self.check_plugin_updates(ui.ctx());
                     self.reload_market(ui.ctx());
                 }
                 if self.market_loading {
                     ui.spinner();
                 } else if self.market_loaded {
                     ui.label(
-                        egui::RichText::new(format!("市场共 {} 个插件", self.market.len()))
+                        egui::RichText::new(trf!("市场共 {} 个插件", self.market.len()))
                             .size(12.5)
                             .color(theme::dim()),
                     );
@@ -1283,10 +1498,7 @@ impl App {
         });
         ui.add_space(2.0);
         ui.label(
-            egui::RichText::new(format!(
-                "搜索并管理 DeepSeek Harness 插件（profile: {}）。启停写入 cordis.patch.yml。",
-                self.profile()
-            ))
+            egui::RichText::new(trf!("搜索并管理 DeepSeek Harness 插件（profile: {}）。启停写入 cordis.patch.yml。", self.profile()))
             .size(13.0)
             .color(theme::dim()),
         );
@@ -1297,19 +1509,16 @@ impl App {
             .plugin_scan
             .scanned_at
             .map(|t| t.elapsed().as_secs())
-            .map(|s| if s < 5 { "刚刚".to_string() } else { format!("{} 秒前", s) })
-            .unwrap_or_else(|| "尚未扫描".to_string());
-        let roots_hover = format!(
-            "插件是从这些地方找出来的：\n{}",
-            if self.plugin_scan.roots.is_empty() {
+            .map(|s| if s < 5 { tr!("刚刚").to_string() } else { trf!("{} 秒前", s) })
+            .unwrap_or_else(|| tr!("尚未扫描").to_string());
+        let roots_hover = trf!("插件是从这些地方找出来的：\n{}", if self.plugin_scan.roots.is_empty() {
                 "（没有可查的目录）".to_string()
             } else {
                 self.plugin_scan.roots.join("\n")
-            }
-        );
+            });
         ui.horizontal_wrapped(|ui| {
             ui.label(
-                egui::RichText::new(format!("扫描途径（profile {}，{} 刷新）：", self.plugin_scan.profile, age))
+                egui::RichText::new(trf!("扫描途径（profile {}，{} 刷新）：", self.plugin_scan.profile, age))
                     .size(12.0)
                     .color(theme::dim()),
             )
@@ -1323,7 +1532,7 @@ impl App {
                 .collect();
             if hit.is_empty() {
                 ui.label(
-                    egui::RichText::new("（一条途径都没扫到东西）")
+                    egui::RichText::new(tr!("（一条途径都没扫到东西）"))
                         .size(11.5)
                         .color(theme::warn()),
                 );
@@ -1339,14 +1548,17 @@ impl App {
         });
         ui.add_space(10.0);
 
+        // —— 待确认的动作（更新插件 / 清除补丁条目）：写配置前先问一句 ——
+        self.confirm_bar(ui);
+
         // 搜索行
         ui.horizontal(|ui| {
             ui.add(
                 egui::TextEdit::singleline(&mut self.market_query)
-                    .hint_text("搜索插件名称 / 作者 / 描述…")
+                    .hint_text(tr!("搜索插件名称 / 作者 / 描述…"))
                     .desired_width(300.0),
             );
-            if ui.button("搜索 GitHub").clicked() {
+            if ui.button(tr!("搜索 GitHub")).clicked() {
                 let q = self.market_query.clone();
                 self.github_loading = true;
                 self.tasks.spawn(ui.ctx(), move || {
@@ -1368,7 +1580,7 @@ impl App {
             for c in cats {
                 let selected = self.market_category == c;
                 let label = if c == "全部" {
-                    "全部".to_string()
+                    tr!("全部").to_string()
                 } else {
                     plugins::category_label(c)
                 };
@@ -1391,14 +1603,14 @@ impl App {
         let scan = self.plugin_scan.clone();
         if scan.plugins.is_empty() {
             ui.label(
-                egui::RichText::new("没有扫描到已安装的插件。")
+                egui::RichText::new(tr!("没有扫描到已安装的插件。"))
                     .size(13.0)
                     .color(theme::dim()),
             );
             ui.add_space(8.0);
         } else {
             egui::CollapsingHeader::new(
-                egui::RichText::new(format!("已安装插件（{}）", scan.plugins.len()))
+                egui::RichText::new(trf!("已安装插件（{}）", scan.plugins.len()))
                     .size(14.5)
                     .strong()
                     .color(theme::text()),
@@ -1415,18 +1627,18 @@ impl App {
                     scan.plugins.len(),
                     |ui| {
                         for p in scan.plugins.iter() {
-                            actions.push(installed_row(ui, p));
+                            // 只有确实比装的新的版本才当"可更新"
+                            let latest = self
+                                .plugin_updates
+                                .get(&p.package)
+                                .map(|s| s.as_str())
+                                .filter(|l| plugins::is_newer(l, &p.version));
+                            actions.push(installed_row(ui, p, latest));
                         }
                     },
                 );
                 for a in actions {
-                    match a {
-                        InstalledAction::None => {}
-                        InstalledAction::Uninstall(pkg) => self.uninstall_plugin(&ctx, pkg),
-                        InstalledAction::Toggle { label, ids, enabled } => {
-                            self.toggle_plugin(&ctx, label, ids, enabled)
-                        }
-                    }
+                    self.run_installed_action(&ctx, a);
                 }
             });
             ui.add_space(10.0);
@@ -1435,7 +1647,7 @@ impl App {
         // —— 补丁条目：cordis.patch.yml 里按 id 引用、但没有对应包的条目 ——
         if !scan.patch_rows.is_empty() {
             egui::CollapsingHeader::new(
-                egui::RichText::new(format!("补丁条目（{}）", scan.patch_rows.len()))
+                egui::RichText::new(trf!("补丁条目（{}）", scan.patch_rows.len()))
                     .size(14.0)
                     .strong()
                     .color(theme::text()),
@@ -1444,7 +1656,7 @@ impl App {
             .show(ui, |ui| {
                 ui.label(
                     egui::RichText::new(
-                        "这些 id 出现在 profile 的 cordis.patch.yml 里，但没找到对应的插件包（可能是官方模块的启停行，或插件已被删掉）。",
+                        tr!("这些 id 出现在 profile 的 cordis.patch.yml 里，但没找到对应的插件包（可能是官方模块的启停行，或插件已被删掉）。"),
                     )
                     .size(12.0)
                     .color(theme::dim()),
@@ -1453,16 +1665,10 @@ impl App {
                 let ctx = ui.ctx().clone();
                 let mut actions = Vec::new();
                 for p in scan.patch_rows.iter() {
-                    actions.push(installed_row(ui, p));
+                    actions.push(installed_row(ui, p, None));
                 }
                 for a in actions {
-                    match a {
-                        InstalledAction::None => {}
-                        InstalledAction::Uninstall(pkg) => self.uninstall_plugin(&ctx, pkg),
-                        InstalledAction::Toggle { label, ids, enabled } => {
-                            self.toggle_plugin(&ctx, label, ids, enabled)
-                        }
-                    }
+                    self.run_installed_action(&ctx, a);
                 }
             });
             ui.add_space(10.0);
@@ -1474,7 +1680,7 @@ impl App {
         // —— 扫描提示 ——
         if !scan.warnings.is_empty() {
             egui::CollapsingHeader::new(
-                egui::RichText::new(format!("扫描提示（{}）", scan.warnings.len()))
+                egui::RichText::new(trf!("扫描提示（{}）", scan.warnings.len()))
                     .size(13.5)
                     .color(theme::warn()),
             )
@@ -1490,7 +1696,7 @@ impl App {
         // —— GitHub 搜索结果 ——
         if !self.github_results.is_empty() {
             ui.label(
-                egui::RichText::new(format!("GitHub 搜索结果（{}）", self.github_results.len()))
+                egui::RichText::new(trf!("GitHub 搜索结果（{}）", self.github_results.len()))
                     .size(14.0)
                     .strong()
                     .color(theme::text()),
@@ -1513,9 +1719,9 @@ impl App {
             ui.horizontal(|ui| {
                 ui.spinner();
                 ui.label(
-                    egui::RichText::new("正在加载插件市场…").size(14.0).color(theme::dim()),
+                    egui::RichText::new(tr!("正在加载插件市场…")).size(14.0).color(theme::dim()),
                 );
-                if ui.button("重新加载").clicked() {
+                if ui.button(tr!("重新加载")).clicked() {
                     self.reload_market(ui.ctx());
                 }
             });
@@ -1525,7 +1731,7 @@ impl App {
         let filtered =
             plugins::filter_local(&self.market, &self.market_query, &self.market_category);
         ui.label(
-            egui::RichText::new(format!("插件市场（{} 个结果）", filtered.len()))
+            egui::RichText::new(trf!("插件市场（{} 个结果）", filtered.len()))
                 .size(14.0)
                 .strong()
                 .color(theme::text()),
@@ -1547,152 +1753,219 @@ impl App {
     // ------------------------------------------------------ 设置
 
     fn tab_settings(&mut self, ui: &mut egui::Ui) {
-        ui.heading(egui::RichText::new("设置").size(21.0).color(theme::text()));
+        ui.heading(egui::RichText::new(tr!("设置")).size(21.0).color(theme::text()));
         ui.add_space(12.0);
 
-        let mut changed = false;
+        // 设置项比窗口高（尤其小窗口），套一层滚动区：滚轮 / 拖气泡都能翻到底部卡片
+        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+            let mut changed = false;
 
-        // 风格：浅色 / 深色（切换立即生效，并写进设置）
-        card(ui, |ui| {
-            ui.label(egui::RichText::new("风格").size(14.0).strong().color(theme::text()));
-            ui.add_space(8.0);
-            let mut dark = self.settings.theme == ThemeMode::Dark;
-            let before = dark;
-            ui.radio_value(&mut dark, false, "浅色");
-            ui.radio_value(&mut dark, true, "深色");
-            if dark != before {
-                self.settings.theme = if dark { ThemeMode::Dark } else { ThemeMode::Light };
-                theme::set_dark(dark);
-                apply_theme(ui.ctx());
-                ui.ctx().request_repaint();
-                changed = true;
-            }
-        });
-
-        ui.add_space(10.0);
-
-        card(ui, |ui| {
-            ui.label(egui::RichText::new("服务地址").size(14.0).strong().color(theme::text()));
-            ui.add_space(4.0);
-            ui.horizontal(|ui| {
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.settings.url)
-                        .desired_width(300.0),
+            // 语言：中文 / English（切换立即生效并写进设置）
+            // 标题写成"语言/Language"这种双语形式：它本身就是语言设置，
+            // 翻译成单一语言反而让人找不着。
+            card(ui, |ui| {
+                ui.label(
+                    egui::RichText::new("语言/Language")
+                        .size(14.0)
+                        .strong()
+                        .color(theme::text()),
                 );
-                if ui.button("应用").clicked() {
+                ui.add_space(8.0);
+                let mut language = self.settings.language;
+                let before = language;
+                egui::ComboBox::from_id_salt("language")
+                    .selected_text(language.label())
+                    .width(160.0)
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut language, Lang::Zh, Lang::Zh.label());
+                        ui.selectable_value(&mut language, Lang::En, Lang::En.label());
+                    });
+                if language != before {
+                    self.settings.language = language;
+                    i18n::set(language);
+                    changed = true;
+                    ui.ctx().request_repaint();
+                }
+            });
+
+            ui.add_space(10.0);
+
+            // 风格：浅色 / 深色（切换立即生效，并写进设置）
+            card(ui, |ui| {
+                ui.label(egui::RichText::new(tr!("风格")).size(14.0).strong().color(theme::text()));
+                ui.add_space(8.0);
+                let mut dark = self.settings.theme == ThemeMode::Dark;
+                let before = dark;
+                ui.radio_value(&mut dark, false, tr!("浅色"));
+                ui.radio_value(&mut dark, true, tr!("深色"));
+                if dark != before {
+                    self.settings.theme = if dark { ThemeMode::Dark } else { ThemeMode::Light };
+                    theme::set_dark(dark);
+                    apply_theme(ui.ctx());
+                    ui.ctx().request_repaint();
                     changed = true;
                 }
             });
-            ui.label(
-                egui::RichText::new("DSH Web UI 的地址，host/port 同时用于启动参数与端口探测。")
-                    .size(12.0)
-                    .color(theme::dim()),
-            );
-        });
 
-        ui.add_space(10.0);
+            ui.add_space(10.0);
 
-        card(ui, |ui| {
-            ui.label(egui::RichText::new("Profile").size(14.0).strong().color(theme::text()));
-            ui.add_space(6.0);
-            ui.horizontal(|ui| {
-                const PRESETS: [&str; 2] = ["web", "desktop"];
-                // 「当前是哪个模式」完全由输入框里的内容决定：
-                // 输入 web / desktop 就是对应预设，其它任何值就是自定义。
-                // 所以不需要额外的状态字段，手输与下拉永远一致。
-                let text = self.settings.profile.trim().to_string();
-                let is_preset = PRESETS.contains(&text.as_str());
-
-                // 输入框：直接手输
-                let resp = ui.add(
-                    egui::TextEdit::singleline(&mut self.settings.profile)
-                        .desired_width(150.0)
-                        .hint_text("profile 名"),
+            card(ui, |ui| {
+                ui.label(egui::RichText::new(tr!("服务地址")).size(14.0).strong().color(theme::text()));
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.settings.url)
+                            .desired_width(300.0),
+                    );
+                    if ui.button(tr!("应用")).clicked() {
+                        changed = true;
+                    }
+                });
+                ui.label(
+                    egui::RichText::new(tr!("DSH Web UI 的地址，host/port 同时用于启动参数与端口探测。"))
+                        .size(12.0)
+                        .color(theme::dim()),
                 );
-                if resp.changed() {
-                    changed = true;
-                }
+            });
 
-                // 选项框：显示当前落在哪个预设上；选预设即填入，选自定义即清空等你输
-                let mode = if is_preset { text.as_str() } else { "自定义" };
-                egui::ComboBox::from_id_salt("profile-preset")
-                    .selected_text(mode)
-                    .width(96.0)
-                    .show_ui(ui, |ui| {
-                        for p in PRESETS {
-                            if ui.selectable_label(text == p, p).clicked() && text != p {
-                                self.settings.profile = p.to_string();
+            ui.add_space(10.0);
+
+            card(ui, |ui| {
+                ui.label(egui::RichText::new("Profile").size(14.0).strong().color(theme::text()));
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    const PRESETS: [&str; 2] = ["web", "desktop"];
+                    // 「当前是哪个模式」完全由输入框里的内容决定：
+                    // 输入 web / desktop 就是对应预设，其它任何值就是自定义。
+                    // 所以不需要额外的状态字段，手输与下拉永远一致。
+                    let text = self.settings.profile.trim().to_string();
+                    let is_preset = PRESETS.contains(&text.as_str());
+
+                    // 输入框：直接手输
+                    let resp = ui.add(
+                        egui::TextEdit::singleline(&mut self.settings.profile)
+                            .desired_width(150.0)
+                            .hint_text(tr!("profile 名")),
+                    );
+                    if resp.changed() {
+                        changed = true;
+                    }
+
+                    // 选项框：显示当前落在哪个预设上；选预设即填入，选自定义即清空等你输
+                    let mode = if is_preset { text.as_str() } else { tr!("自定义") };
+                    egui::ComboBox::from_id_salt("profile-preset")
+                        .selected_text(mode)
+                        .width(96.0)
+                        .show_ui(ui, |ui| {
+                            for p in PRESETS {
+                                if ui.selectable_label(text == p, p).clicked() && text != p {
+                                    self.settings.profile = p.to_string();
+                                    changed = true;
+                                }
+                            }
+                            if ui.selectable_label(!is_preset, tr!("自定义")).clicked() && is_preset {
+                                // 从预设切到自定义：清空输入框，直接开始敲
+                                self.settings.profile.clear();
                                 changed = true;
                             }
-                        }
-                        if ui.selectable_label(!is_preset, "自定义").clicked() && is_preset {
-                            // 从预设切到自定义：清空输入框，直接开始敲
-                            self.settings.profile.clear();
-                            changed = true;
-                        }
-                    });
-            });
-            ui.add_space(4.0);
-            ui.label(
-                egui::RichText::new("决定启动哪个 profile；插件也装进这一份。")
-                    .size(12.0)
-                    .color(theme::dim()),
-            );
-            if self.settings.profile.trim().is_empty() {
-                ui.label(
-                    egui::RichText::new("profile 不能为空，将按 web 处理。")
-                        .size(12.0)
-                        .color(theme::warn()),
-                );
-            }
-        });
-
-        ui.add_space(10.0);
-
-        // 关闭按钮行为（✕ 是收进托盘还是直接退出）
-        card(ui, |ui| {
-            ui.label(egui::RichText::new("关闭按钮行为").size(14.0).strong().color(theme::text()));
-            ui.add_space(8.0);
-            let mut to_tray = self.settings.close_action == CloseAction::Tray;
-            let before = to_tray;
-            ui.radio_value(&mut to_tray, true, "最小化到系统托盘（后台继续运行）");
-            ui.radio_value(&mut to_tray, false, "直接关闭（点 × 即刻退出）");
-            if to_tray != before {
-                self.settings.close_action =
-                    if to_tray { CloseAction::Tray } else { CloseAction::Exit };
-                // 托盘右键菜单里那一项的勾要跟着变
-                tray::set_close_to_tray(to_tray);
-                changed = true;
-            }
-            if !self.tray_ok {
+                        });
+                });
                 ui.add_space(4.0);
                 ui.label(
-                    egui::RichText::new("当前平台不支持系统托盘，关闭按钮将直接退出。")
+                    egui::RichText::new(tr!("决定启动哪个 profile；插件也装进这一份。"))
                         .size(12.0)
-                        .color(theme::warn()),
+                        .color(theme::dim()),
                 );
+                if self.settings.profile.trim().is_empty() {
+                    ui.label(
+                        egui::RichText::new(tr!("profile 不能为空，将按 web 处理。"))
+                            .size(12.0)
+                            .color(theme::warn()),
+                    );
+                }
+            });
+
+            ui.add_space(10.0);
+
+            // 关闭按钮行为（✕ 是收进托盘还是直接退出）
+            card(ui, |ui| {
+                ui.label(egui::RichText::new(tr!("关闭按钮行为")).size(14.0).strong().color(theme::text()));
+                ui.add_space(8.0);
+                let mut to_tray = self.settings.close_action == CloseAction::Tray;
+                let before = to_tray;
+                ui.radio_value(&mut to_tray, true, tr!("最小化到系统托盘（后台继续运行）"));
+                ui.radio_value(&mut to_tray, false, tr!("直接关闭（点 × 即刻退出）"));
+                if to_tray != before {
+                    self.settings.close_action =
+                        if to_tray { CloseAction::Tray } else { CloseAction::Exit };
+                    // 托盘右键菜单里那一项的勾要跟着变
+                    tray::set_close_to_tray(to_tray);
+                    changed = true;
+                }
+                if !self.tray_ok {
+                    ui.add_space(4.0);
+                    ui.label(
+                        egui::RichText::new(tr!("当前平台不支持系统托盘，关闭按钮将直接退出。"))
+                            .size(12.0)
+                            .color(theme::warn()),
+                    );
+                }
+            });
+
+            ui.add_space(10.0);
+
+            card(ui, |ui| {
+                let mut auto = self.settings.auto_open_browser;
+                if ui
+                    .checkbox(&mut auto, tr!("启动 DSH 后自动在浏览器打开 Web UI"))
+                    .changed()
+                {
+                    self.settings.auto_open_browser = auto;
+                    changed = true;
+                }
+            });
+
+            ui.add_space(10.0);
+
+            // 插件更新策略：自动装 / 只检查、等确认
+            card(ui, |ui| {
+                ui.label(
+                    egui::RichText::new(tr!("插件更新"))
+                        .size(14.0)
+                        .strong()
+                        .color(theme::text()),
+                );
+                ui.add_space(8.0);
+                let mut auto = self.settings.auto_update_plugins;
+                let before = auto;
+                ui.radio_value(&mut auto, false, tr!("只自动检查：发现新版本后在插件页标出来，确认后才更新"));
+                ui.radio_value(&mut auto, true, tr!("自动更新：检查到新版本就直接更新到最新版"));
+                if auto != before {
+                    self.settings.auto_update_plugins = auto;
+                    // 刚打开"自动更新"→ 允许本轮再自动跑一次
+                    if auto {
+                        self.auto_update_ran = false;
+                    }
+                    changed = true;
+                }
+                ui.add_space(4.0);
+                ui.label(
+                    egui::RichText::new(
+                        tr!("更新走的是 dsh 自己的插件命令：dsh plugin --profile <profile> add <包名>@latest（底层 pnpm）。"),
+                    )
+                    .size(12.0)
+                    .color(theme::dim()),
+                );
+            });
+
+            if changed {
+                self.settings.save();
+                self.rescan_plugins();
+                // 改了插件更新策略：立刻重查一次（开着"自动更新"的话顺手把插件升掉）
+                self.check_plugin_updates(ui.ctx());
+                self.toast = Some((tr!("设置已保存").into(), false));
             }
         });
-
-        ui.add_space(10.0);
-
-        card(ui, |ui| {
-            let mut auto = self.settings.auto_open_browser;
-            if ui
-                .checkbox(&mut auto, "启动 DSH 后自动在浏览器打开 Web UI")
-                .changed()
-            {
-                self.settings.auto_open_browser = auto;
-                changed = true;
-            }
-        });
-
-        if changed {
-            self.settings.save();
-            self.rescan_plugins();
-            self.toast = Some(("设置已保存".into(), false));
-        }
-
     }
 
     // ------------------------------------------------------ 提示条
@@ -1820,6 +2093,45 @@ enum InstalledAction {
         ids: Vec<String>,
         enabled: bool,
     },
+    /// 更新到最新版（`latest` 是查到的最新版本号，可能没查到）
+    Update {
+        package: String,
+        latest: Option<String>,
+    },
+    /// 清除补丁里的这个条目
+    ClearPatch(String),
+}
+
+/// 需要用户点一下"确认"才会执行的动作（写在配置里的改动，先问一句）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ConfirmAction {
+    /// 把插件更新到最新版（`latest` 为空表示"更新到最新"，版本号未知）
+    Update { package: String, latest: Option<String> },
+    /// 从 cordis.patch.yml 里删掉这个条目
+    ClearPatch { id: String },
+}
+
+impl ConfirmAction {
+    /// 确认条上的一句话。
+    fn question(&self) -> String {
+        match self {
+            Self::Update { package, latest: Some(v) } => {
+                trf!("把 {} 更新到最新版 {}？", package, v)
+            }
+            Self::Update { package, latest: None } => {
+                trf!("把 {} 更新到最新版？", package)
+            }
+            Self::ClearPatch { id } => trf!("从 cordis.patch.yml 里清除补丁条目 {}？（会先备份成 .bak）", id),
+        }
+    }
+
+    /// 确认按钮上的字。
+    fn ok_label(&self) -> &'static str {
+        match self {
+            Self::Update { .. } => tr!("确认更新"),
+            Self::ClearPatch { .. } => tr!("清除"),
+        }
+    }
 }
 
 /// 已安装插件一屏显示的行数：超出的靠滚轮 / 拖动滚动条气泡翻。
@@ -1865,11 +2177,18 @@ fn route_color(r: PluginRoute) -> egui::Color32 {
     }
 }
 
-/// 已装插件的一行：包名 + 版本 + 途径标签 + id 行 + 启停/卸载。
+/// 已装插件的一行：包名 + 版本 + 途径标签 + id 行 + 更新/启停/卸载。
 ///
 /// 行高被 `PLUGIN_ROW_CONTENT_H` 固定住（id 行截断成一行），否则字号或长包名一变，
 /// "一屏正好 4 行"就算不准。
-fn installed_row(ui: &mut egui::Ui, p: &InstalledPlugin) -> InstalledAction {
+///
+/// `latest`：后台查到的最新版本，且确实比装的新——有值时按钮变成「更新 <版本>」，
+/// 版本号旁边也会显示 `已装 → 最新`。
+fn installed_row(
+    ui: &mut egui::Ui,
+    p: &InstalledPlugin,
+    latest: Option<&str>,
+) -> InstalledAction {
     let mut action = InstalledAction::None;
     egui::Frame::NONE
         .fill(theme::card())
@@ -1890,8 +2209,20 @@ fn installed_row(ui: &mut egui::Ui, p: &InstalledPlugin) -> InstalledAction {
                 if let Some(dir) = &p.dir {
                     name.on_hover_text(dir.display().to_string());
                 }
-                if !p.version.is_empty() {
-                    ui.label(egui::RichText::new(&p.version).size(12.0).color(theme::dim()));
+                match (p.version.is_empty(), latest) {
+                    (false, Some(v)) => {
+                        ui.label(
+                            egui::RichText::new(format!("{} → {}", p.version, v))
+                                .size(12.0)
+                                .strong()
+                                .color(theme::ok()),
+                        )
+                        .on_hover_text(tr!("已装版本 → npm 上的最新版本"));
+                    }
+                    (false, None) => {
+                        ui.label(egui::RichText::new(&p.version).size(12.0).color(theme::dim()));
+                    }
+                    _ => {}
                 }
                 // 途径标签：最多显示两个，其余折成 "+N"，悬停看完整解释
                 for r in p.routes.iter().take(2) {
@@ -1907,14 +2238,24 @@ fn installed_row(ui: &mut egui::Ui, p: &InstalledPlugin) -> InstalledAction {
                     .on_hover_text(p.route_detail());
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if p.patch_only {
+                        // 补丁条目：只能手动清除（会先备份 .bak）
+                        if ui
+                            .button(tr!("清除"))
+                            .on_hover_text(tr!("把这个条目从 profile 的 cordis.patch.yml 里删掉"))
+                            .clicked()
+                        {
+                            action = InstalledAction::ClearPatch(p.package.clone());
+                        }
+                        return;
+                    }
                     // 自带层不给"卸载"：那是 dsh 安装自己的依赖，删了会把平台拆坏
-                    let removable =
-                        !p.patch_only && p.origin == PluginOrigin::Profile;
-                    if removable && ui.button("卸载").clicked() {
+                    let removable = p.origin == PluginOrigin::Profile;
+                    if removable && ui.button(tr!("卸载")).clicked() {
                         action = InstalledAction::Uninstall(p.package.clone());
                     }
                     if !p.ids.is_empty() {
-                        let label = if p.enabled { "禁用" } else { "启用" };
+                        let label = if p.enabled { tr!("禁用") } else { tr!("启用") };
                         if ui.button(label).clicked() {
                             action = InstalledAction::Toggle {
                                 label: p.package.clone(),
@@ -1923,9 +2264,43 @@ fn installed_row(ui: &mut egui::Ui, p: &InstalledPlugin) -> InstalledAction {
                             };
                         }
                     }
+                    // 更新按钮：查到新版才可点，否则置灰并说明原因
+                    let (enabled_btn, hint) = match latest {
+                        Some(v) => (true, trf!("更新到 {}", v)),
+                        None if p.version.is_empty() => {
+                            (false, tr!("读不到已装版本，无法判断是否有新版").to_string())
+                        }
+                        None => (
+                            false,
+                            tr!("已是最新，或这个包不是从 npm 装的（GitHub / 本地路径）——查不到新版")
+                                .to_string(),
+                        ),
+                    };
+                    let label = match latest {
+                        Some(v) => trf!("更新 {}", v),
+                        None => tr!("更新").to_string(),
+                    };
+                    let btn = egui::Button::new(
+                        egui::RichText::new(label)
+                            .size(14.0)
+                            .color(if enabled_btn { egui::Color32::WHITE } else { theme::dim() }),
+                    )
+                    .fill(if enabled_btn { theme::accent_solid() } else { theme::surface() })
+                    .stroke(egui::Stroke::NONE);
+                    if ui
+                        .add_enabled(enabled_btn, btn)
+                        .on_hover_text(hint.clone())
+                        .on_disabled_hover_text(hint)
+                        .clicked()
+                    {
+                        action = InstalledAction::Update {
+                            package: p.package.clone(),
+                            latest: latest.map(|s| s.to_string()),
+                        };
+                    }
                 });
             });
-            let warn = p.ids.is_empty() || p.patch_only;
+            let warn = !p.patch_only && p.ids.is_empty();
             // 截断成一行（完整内容在悬停里）：id 多的时候换行会把行高顶开
             let line = ui.add(
                 egui::Label::new(
@@ -2009,10 +2384,10 @@ fn plugin_row(ui: &mut egui::Ui, p: &PluginInfo) -> RowAction {
                     }
                 });
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button("安装").clicked() {
+                    if ui.button(tr!("安装")).clicked() {
                         action = RowAction::Install(p.clone());
                     }
-                    if !p.url.is_empty() && ui.button("仓库").clicked() {
+                    if !p.url.is_empty() && ui.button(tr!("仓库")).clicked() {
                         action = RowAction::OpenRepo(p.url.clone());
                     }
                 });
@@ -2048,10 +2423,10 @@ fn fmt_dur(secs: u64) -> String {
     let m = (secs % 3600) / 60;
     let s = secs % 60;
     if h > 0 {
-        format!("{} 小时 {} 分", h, m)
+        trf!("{} 小时 {} 分", h, m)
     } else if m > 0 {
-        format!("{} 分 {} 秒", m, s)
+        trf!("{} 分 {} 秒", m, s)
     } else {
-        format!("{} 秒", s)
+        trf!("{} 秒", s)
     }
 }

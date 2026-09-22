@@ -54,6 +54,7 @@ pub fn take_action() -> Option<TrayAction> {
 #[cfg(windows)]
 mod imp {
     use super::{TrayAction, PENDING};
+    use crate::tr;
     use std::sync::OnceLock;
 
     use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
@@ -153,11 +154,11 @@ mod imp {
     fn popup_menu(hwnd: isize) -> usize {
         unsafe {
             let menu = CreatePopupMenu();
-            let toggle = wide(if window_visible() { "隐藏主窗口" } else { "显示主窗口" });
-            let start = wide("启动 DeepSeek Harness");
-            let stop = wide("关闭 DeepSeek Harness");
-            let open = wide("在浏览器打开 Web UI");
-            let quit = wide("退出（同时关闭 DSH）");
+            let toggle = wide(if window_visible() { tr!("隐藏主窗口") } else { tr!("显示主窗口") });
+            let start = wide(tr!("启动 DeepSeek Harness"));
+            let stop = wide(tr!("关闭 DeepSeek Harness"));
+            let open = wide(tr!("在浏览器打开 Web UI"));
+            let quit = wide(tr!("退出（同时关闭 DSH）"));
             AppendMenuW(menu, MF_STRING, CMD_TOGGLE, toggle.as_ptr());
             AppendMenuW(menu, MF_SEPARATOR, 0, std::ptr::null());
             AppendMenuW(menu, MF_STRING, CMD_START, start.as_ptr());
@@ -168,12 +169,12 @@ mod imp {
             // 「关闭按钮行为」子菜单：当前生效的那一项打勾（单选观感）
             let to_tray = super::close_to_tray();
             let sub = CreatePopupMenu();
-            let opt_tray = wide("最小化到系统托盘（后台继续运行）");
-            let opt_exit = wide("直接关闭启动器");
+            let opt_tray = wide(tr!("最小化到系统托盘（后台继续运行）"));
+            let opt_exit = wide(tr!("直接关闭启动器"));
             let flag = |on: bool| if on { MF_STRING | MF_CHECKED } else { MF_STRING };
             AppendMenuW(sub, flag(to_tray), CMD_CLOSE_TRAY, opt_tray.as_ptr());
             AppendMenuW(sub, flag(!to_tray), CMD_CLOSE_EXIT, opt_exit.as_ptr());
-            let sub_title = wide("关闭按钮行为");
+            let sub_title = wide(tr!("关闭按钮行为"));
             AppendMenuW(menu, MF_POPUP, sub as usize, sub_title.as_ptr());
 
             AppendMenuW(menu, MF_SEPARATOR, 0, std::ptr::null());

@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::config;
 use crate::procs;
+use crate::{tr, trf};
 
 // ------------------------------------------------------------------ 数据结构
 
@@ -77,28 +78,28 @@ impl PluginRoute {
     /// 界面上的短标签。
     pub fn label(self) -> &'static str {
         match self {
-            Self::Dependency => "依赖",
-            Self::BundleLayer => "bundle 层",
+            Self::Dependency => tr!("依赖"),
+            Self::BundleLayer => tr!("bundle 层"),
             Self::ProfileModules => "node_modules",
-            Self::PnpmStore => "pnpm 存储",
-            Self::FallbackModules => "兜底目录",
-            Self::SharedModules => "共享目录",
-            Self::Installation => "dsh 自带",
-            Self::PatchOnly => "补丁引用",
+            Self::PnpmStore => tr!("pnpm 存储"),
+            Self::FallbackModules => tr!("兜底目录"),
+            Self::SharedModules => tr!("共享目录"),
+            Self::Installation => tr!("dsh 自带"),
+            Self::PatchOnly => tr!("补丁引用"),
         }
     }
 
     /// 悬停时的一句话解释。
     pub fn hint(self) -> &'static str {
         match self {
-            Self::Dependency => "profile package.json 的 dependencies 里登记着（dsh plugin add / pnpm add）",
-            Self::BundleLayer => "在 profile 的 dsh.profile.bundles 里，会被加载进 boot graph",
-            Self::ProfileModules => "文件实际存在于 profile 的 node_modules（可能没写进 package.json）",
-            Self::PnpmStore => "位于 pnpm 虚拟存储 .pnpm 里",
-            Self::FallbackModules => "DSH 的模块兜底目录 .dsh-module-fallback/node_modules",
-            Self::SharedModules => "<DSH_HOME>/profiles/node_modules 共享目录（多个 profile 共用）",
-            Self::Installation => "由全局 dsh 安装自带、随 profile 选择加载，不是用户装的（插件页不列出这些平台层）",
-            Self::PatchOnly => "只在 profile 的 cordis.patch.yml 里被引用，没找到对应包",
+            Self::Dependency => tr!("profile package.json 的 dependencies 里登记着（dsh plugin add / pnpm add）"),
+            Self::BundleLayer => tr!("在 profile 的 dsh.profile.bundles 里，会被加载进 boot graph"),
+            Self::ProfileModules => tr!("文件实际存在于 profile 的 node_modules（可能没写进 package.json）"),
+            Self::PnpmStore => tr!("位于 pnpm 虚拟存储 .pnpm 里"),
+            Self::FallbackModules => tr!("DSH 的模块兜底目录 .dsh-module-fallback/node_modules"),
+            Self::SharedModules => tr!("<DSH_HOME>/profiles/node_modules 共享目录（多个 profile 共用）"),
+            Self::Installation => tr!("由全局 dsh 安装自带、随 profile 选择加载，不是用户装的（插件页不列出这些平台层）"),
+            Self::PatchOnly => tr!("只在 profile 的 cordis.patch.yml 里被引用，没找到对应包"),
         }
     }
 
@@ -161,21 +162,21 @@ impl InstalledPlugin {
     /// 启停状态与 id 的说明行。
     pub fn id_line(&self) -> String {
         if self.patch_only {
-            return format!("补丁条目 id: {}", self.package);
+            return trf!("补丁条目 id: {}", self.package);
         }
         if !self.ids.is_empty() {
-            return format!("插件 id: {}", self.ids.join(", "));
+            return trf!("插件 id: {}", self.ids.join(", "));
         }
         if self.dir.is_none() {
-            return "磁盘上没找到这个包（可能已被删除，或没装到这个 profile）".to_string();
+            return tr!("磁盘上没找到这个包（可能已被删除，或没装到这个 profile）").to_string();
         }
         if self.origin == PluginOrigin::Installation {
-            return "平台层：随 profile 的 bundles 加载，不在这里单独启停".to_string();
+            return tr!("平台层：随 profile 的 bundles 加载，不在这里单独启停").to_string();
         }
         if self.layer {
-            return "该包只做 id 覆盖、不 insert 自己的条目，没有可启停的插件".to_string();
+            return tr!("该包只做 id 覆盖、不 insert 自己的条目，没有可启停的插件").to_string();
         }
-        "未声明插件层（dsh.bundle.patch），无法启停".to_string()
+        tr!("未声明插件层（dsh.bundle.patch），无法启停").to_string()
     }
 }
 
@@ -188,15 +189,15 @@ pub fn fetch_market() -> Result<Vec<PluginInfo>, String> {
     let body: serde_json::Value = config::http_agent()
         .get(REGISTRY_URL)
         .call()
-        .map_err(|e| format!("无法访问插件市场: {}", e))?
+        .map_err(|e| trf!("无法访问插件市场: {}", e))?
         .body_mut()
         .read_json()
-        .map_err(|e| format!("插件市场返回内容无法解析: {}", e))?;
+        .map_err(|e| trf!("插件市场返回内容无法解析: {}", e))?;
 
     let arr = body
         .get("plugins")
         .and_then(|x| x.as_array())
-        .ok_or_else(|| "插件市场返回结构异常（缺少 plugins 数组）".to_string())?;
+        .ok_or_else(|| tr!("插件市场返回结构异常（缺少 plugins 数组）").to_string())?;
 
     let mut out = Vec::with_capacity(arr.len());
     for item in arr {
@@ -254,10 +255,10 @@ pub fn search_github(query: &str) -> Result<Vec<PluginInfo>, String> {
         .get(&url)
         .header("Accept", "application/vnd.github+json")
         .call()
-        .map_err(|e| format!("GitHub 搜索失败: {}", e))?
+        .map_err(|e| trf!("GitHub 搜索失败: {}", e))?
         .body_mut()
         .read_json()
-        .map_err(|e| format!("GitHub 返回内容无法解析: {}", e))?;
+        .map_err(|e| trf!("GitHub 返回内容无法解析: {}", e))?;
 
     let mut out = Vec::new();
     for item in body.get("items").and_then(|x| x.as_array()).into_iter().flatten() {
@@ -303,22 +304,22 @@ fn urlencode(s: &str) -> String {
 /// 未知分类原样返回，避免界面上出现空白标签。
 pub fn category_label(key: &str) -> String {
     let zh = match key {
-        "ui" => "界面",
-        "theme" => "主题",
-        "fun" => "趣味",
-        "tools" => "工具",
-        "model" => "模型",
-        "usage" => "用量",
-        "session" => "会话",
-        "memory" => "记忆",
-        "notify" => "通知",
-        "workflow" => "工作流",
+        "ui" => tr!("界面"),
+        "theme" => tr!("主题"),
+        "fun" => tr!("趣味"),
+        "tools" => tr!("工具"),
+        "model" => tr!("模型"),
+        "usage" => tr!("用量"),
+        "session" => tr!("会话"),
+        "memory" => tr!("记忆"),
+        "notify" => tr!("通知"),
+        "workflow" => tr!("工作流"),
         "git" => "Git",
-        "docs" => "文档",
-        "voice" => "语音",
-        "vision" => "视觉",
-        "security" => "安全",
-        "market" => "市场",
+        "docs" => tr!("文档"),
+        "voice" => tr!("语音"),
+        "vision" => tr!("视觉"),
+        "security" => tr!("安全"),
+        "market" => tr!("市场"),
         // GitHub 搜索结果自带这个分类，专有名词保持原样
         "github" => "GitHub",
         _ => return key.to_string(),
@@ -331,6 +332,7 @@ pub fn filter_local(list: &[PluginInfo], query: &str, category: &str) -> Vec<Plu
     let q = query.trim().to_lowercase();
     list.iter()
         .filter(|p| {
+            // 注意："全部" 是**数据值**（跟界面上的分类键比较），不能翻译
             if !category.is_empty() && category != "全部" && p.category != category {
                 return false;
             }
@@ -448,10 +450,10 @@ pub fn scan_with(ctx: &ScanContext, profile: &str) -> ScanReport {
 
     let doc = read_json(&dir.join("package.json"));
     if doc.is_none() && !dir.is_dir() {
-        rep.warnings.push(format!("profile 目录不存在：{}", dir.display()));
+        rep.warnings.push(trf!("profile 目录不存在：{}", dir.display()));
     } else if doc.is_none() {
         rep.warnings
-            .push(format!("读不到或解析不了 {}", profile_package_json(profile).display()));
+            .push(trf!("读不到或解析不了 {}", profile_package_json(profile).display()));
     }
     let deps = dep_map(doc.as_ref());
     let bundles = bundle_list(doc.as_ref());
@@ -459,7 +461,7 @@ pub fn scan_with(ctx: &ScanContext, profile: &str) -> ScanReport {
         Some(d) => dep_map(read_json(&d.join("package.json")).as_ref()),
         None => {
             rep.warnings
-                .push("未解析到全局 dsh 安装，无法区分平台自带层".to_string());
+                .push(tr!("未解析到全局 dsh 安装，无法区分平台自带层").to_string());
             Default::default()
         }
     };
@@ -952,6 +954,46 @@ fn document_line(lines: &[String]) -> Option<usize> {
     })
 }
 
+/// 从 patch 文本里**删掉**某个顶层条目（含它的子行）；返回改写后的文本。
+///
+/// 只动这一个块，其余条目与注释原样保留。删空了（只剩注释）会补一个 `[]`——
+/// 只有注释的 YAML 是 `null`，DSH 下次启动会读不了这个 profile。
+pub fn remove_patch_entry(patch: &str, id: &str) -> Result<String, String> {
+    let lines: Vec<&str> = patch.lines().collect();
+    let Some((start, end)) = block_range(&lines, id) else {
+        return Err(trf!("补丁里没有 id 为 {} 的条目", id));
+    };
+    let mut out: Vec<&str> = Vec::with_capacity(lines.len());
+    out.extend_from_slice(&lines[..start]);
+    // 顺带吃掉紧跟在这个块后面的一个空行，免得反复增删越留越多空行
+    let mut rest = end;
+    if rest < lines.len() && lines[rest].trim().is_empty() {
+        rest += 1;
+    }
+    out.extend_from_slice(&lines[rest..]);
+    let mut text = out.join("\n");
+    if patch.ends_with('\n') {
+        text.push('\n');
+    }
+    Ok(ensure_patch_document(&text))
+}
+
+/// 补丁里没有"文档内容"（只剩注释/空行）时补一个空数组 `[]`。
+fn ensure_patch_document(text: &str) -> String {
+    let has_doc = text
+        .lines()
+        .any(|l| !l.trim().is_empty() && !l.trim_start().starts_with('#'));
+    if has_doc {
+        return text.to_string();
+    }
+    let mut s = text.trim_end().to_string();
+    if !s.is_empty() {
+        s.push('\n');
+    }
+    s.push_str("[]\n");
+    s
+}
+
 /// 设置某插件的启用状态；返回改写后的文本。
 ///
 /// 已存在条目 → 原地改 `disabled:`；不存在 → 追加一个顶层条目。
@@ -989,8 +1031,8 @@ pub fn set_enabled_in_patch(patch: &str, id: &str, enabled: bool) -> Result<Stri
                 lines.remove(i);
             } else if root.starts_with('[') {
                 return Err(
-                    "该文件用的是流式数组写法（如 [{...}]），启动器不会自动改写以免破坏配置；\
-                     请先把它改成块序列（每行 `- id: ...`）再试。"
+                    tr!("该文件用的是流式数组写法（如 [{...}]），启动器不会自动改写以免破坏配置；\
+                     请先把它改成块序列（每行 `- id: ...`）再试。")
                         .to_string(),
                 );
             }
@@ -1017,7 +1059,7 @@ fn preflight_pnpm() -> Result<(), String> {
     if crate::dsh::which("pnpm").is_some() {
         return Ok(());
     }
-    Err("未找到 pnpm。dsh 的插件命令是转发给 pnpm 执行的，请先安装：\n  npm install -g pnpm\n（或 corepack enable）".to_string())
+    Err(tr!("未找到 pnpm。dsh 的插件命令是转发给 pnpm 执行的，请先安装：\n  npm install -g pnpm\n（或 corepack enable）").to_string())
 }
 
 /// 用 DSH 自带的插件命令安装（走 pnpm，与 dsh-market 相同的路径）。
@@ -1035,8 +1077,73 @@ pub fn install(profile: &str, spec: &str) -> Result<String, String> {
     if ok {
         Ok(text)
     } else {
-        Err(format!("安装失败：\n{}\n\n可手动执行：\ndsh plugin --profile {} add {}", text, profile, spec))
+        Err(trf!("安装失败：\n{}\n\n可手动执行：\ndsh plugin --profile {} add {}", text, profile, spec))
     }
+}
+
+/// 把插件更新到最新版（等价于 `dsh plugin --profile <p> add <包名>@latest`）。
+pub fn update_to_latest(profile: &str, package: &str) -> Result<String, String> {
+    install(profile, &format!("{}@latest", package))
+}
+
+/// 某个包当前装在 profile 里的版本（读磁盘上的 package.json）。
+///
+/// 更新完用它回报"实际装到了哪一版"——npm 的 `latest` 与 pnpm 真正落盘的版本
+/// 可能差一档（pnpm 有最小发布年龄策略），照实说比复述请求值有用。
+pub fn installed_version(profile: &str, package: &str) -> Option<String> {
+    let ctx = ScanContext::detect();
+    let (dir, _) = resolve_package(&ctx, profile, package)?;
+    read_json(&dir.join("package.json"))?
+        .get("version")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+}
+
+/// `latest` 是否比 `installed` 新（两个都按 semver 比；空值一律当"不可比"）。
+pub fn is_newer(latest: &str, installed: &str) -> bool {
+    if latest.is_empty() || installed.is_empty() {
+        return false;
+    }
+    crate::versions::compare_versions(latest, installed) == std::cmp::Ordering::Greater
+}
+
+/// 查这些包在 npm 上的最新版本（`dist-tags.latest`）。
+///
+/// 用 npm 的**精简元数据**（`application/vnd.npm.install-v1+json`），比完整 packument
+/// 小得多；查不到的（GitHub 装的、私有包、网络不通）只记一条提示，不算错误——
+/// 界面据此把「更新」按钮置灰，而不是报错。
+///
+/// 阻塞，调用方放后台线程。
+pub fn fetch_latest(names: &[String]) -> (BTreeMap<String, String>, Vec<String>) {
+    let agent = config::http_agent();
+    let mut found: BTreeMap<String, String> = BTreeMap::new();
+    let mut notes: Vec<String> = Vec::new();
+    for name in names {
+        // 作用域包的斜杠不用转义：registry 接受 /@scope/name 这种写法
+        let url = format!("https://registry.npmjs.org/{}", name);
+        let body = agent
+            .get(&url)
+            .header("Accept", "application/vnd.npm.install-v1+json, application/json")
+            .call()
+            .map_err(|e| format!("{}", e))
+            .and_then(|mut resp| {
+                resp.body_mut().read_json::<serde_json::Value>().map_err(|e| format!("{}", e))
+            });
+        match body {
+            Ok(doc) => match doc
+                .get("dist-tags")
+                .and_then(|t| t.get("latest"))
+                .and_then(|v| v.as_str())
+            {
+                Some(v) if !v.is_empty() => {
+                    found.insert(name.clone(), v.to_string());
+                }
+                _ => notes.push(trf!("{}：registry 里没有 latest 标签", name)),
+            },
+            Err(e) => notes.push(trf!("{}：查不到最新版本（{}）", name, e)),
+        }
+    }
+    (found, notes)
 }
 
 /// 卸载插件。
@@ -1052,8 +1159,27 @@ pub fn uninstall(profile: &str, spec: &str) -> Result<String, String> {
     if ok {
         Ok(text)
     } else {
-        Err(format!("卸载失败：\n{}", text))
+        Err(trf!("卸载失败：\n{}", text))
     }
+}
+
+/// 把 profile 补丁里的某个条目整块删掉（留一份 .bak 备份）。
+pub fn clear_patch_entry(profile: &str, id: &str) -> Result<(), String> {
+    clear_patch_entry_at(&patch_file(profile), id)
+}
+
+/// `clear_patch_entry` 的落地版本：直接对某个 `cordis.patch.yml` 生效（便于测试）。
+pub fn clear_patch_entry_at(path: &Path, id: &str) -> Result<(), String> {
+    let path: PathBuf = path.to_path_buf();
+    let original = std::fs::read_to_string(&path).unwrap_or_default();
+    if original.is_empty() {
+        return Err(trf!("{} 还是空的，没有可清除的条目", path.display()));
+    }
+    let updated = remove_patch_entry(&original, id)?;
+    let _ = std::fs::write(Path::new(&format!("{}.bak", path.display())), &original);
+    std::fs::write(&path, updated).map_err(|e| trf!("写入 {} 失败: {}", path.display(), e))?;
+    config::log(&format!("patch entry {} removed from {}", id, path.display()));
+    Ok(())
 }
 
 /// 把「启用/禁用」写回 profile 的 cordis.patch.yml。
@@ -1064,7 +1190,7 @@ pub fn toggle_ids(profile: &str, ids: &[String], enabled: bool) -> Result<(), St
 /// `toggle_ids` 的落地版本：直接对某个 `cordis.patch.yml` 生效（便于测试）。
 pub fn toggle_ids_at(path: &Path, ids: &[String], enabled: bool) -> Result<(), String> {
     if ids.is_empty() {
-        return Err("该插件没有可启停的条目 id".to_string());
+        return Err(tr!("该插件没有可启停的条目 id").to_string());
     }
     let path: PathBuf = path.to_path_buf();
     let original = std::fs::read_to_string(&path).unwrap_or_default();
@@ -1076,13 +1202,13 @@ pub fn toggle_ids_at(path: &Path, ids: &[String], enabled: bool) -> Result<(), S
         updated = set_enabled_in_patch(&updated, id, enabled)?;
     }
     if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir).map_err(|e| format!("创建目录失败: {}", e))?;
+        std::fs::create_dir_all(dir).map_err(|e| trf!("创建目录失败: {}", e))?;
     }
     // 留一份备份，改坏了可以回退
     if !original.is_empty() {
         let _ = std::fs::write(Path::new(&format!("{}.bak", path.display())), &original);
     }
-    std::fs::write(&path, updated).map_err(|e| format!("写入 {} 失败: {}", path.display(), e))?;
+    std::fs::write(&path, updated).map_err(|e| trf!("写入 {} 失败: {}", path.display(), e))?;
     config::log(&format!(
         "plugin ids [{}] set enabled={} in {}",
         ids.join(", "),
@@ -1201,7 +1327,10 @@ mod tests {
     }
 
     #[test]
-    fn category_labels_are_chinese_with_passthrough() {
+    fn category_labels_follow_the_ui_language() {
+        // 语言是全局状态：拿测试锁，免得并行的 i18n 测试正好切到英文
+        let _g = crate::i18n::TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        crate::i18n::set(crate::i18n::Lang::Zh);
         assert_eq!(category_label("ui"), "界面");
         assert_eq!(category_label("tools"), "工具");
         assert_eq!(category_label("workflow"), "工作流");
@@ -1216,6 +1345,14 @@ mod tests {
         assert_eq!(category_label("github"), "GitHub");
         // 市场随时可能加新分类：未知键原样返回，不能变空白
         assert_eq!(category_label("brand-new-cat"), "brand-new-cat");
+
+        // 英文界面：分类也要跟着变（GitHub 这类专有名词保持原样）
+        crate::i18n::set(crate::i18n::Lang::En);
+        assert_eq!(category_label("ui"), "UI");
+        assert_eq!(category_label("tools"), "Tools");
+        assert_eq!(category_label("github"), "GitHub");
+        assert_eq!(category_label("brand-new-cat"), "brand-new-cat");
+        crate::i18n::set(crate::i18n::Lang::Zh);
     }
 
     #[test]
@@ -1493,5 +1630,91 @@ mod tests {
         assert!(!is_disabled_in_patch(&back, "a-layer"));
         assert!(!is_disabled_in_patch(&back, "b-layer"));
         assert_eq!(assert_valid(&back).len(), 2);
+    }
+
+    // ---------------------------------------------------------- 更新检查 / 清除补丁条目
+
+    #[test]
+    fn is_newer_compares_semver() {
+        assert!(is_newer("1.2.0", "1.1.9"));
+        assert!(is_newer("0.13.5", "0.13.4"));
+        assert!(is_newer("2.0.0", "1.99.99"));
+        assert!(!is_newer("1.2.0", "1.2.0"));
+        assert!(!is_newer("1.1.0", "1.2.0"));
+        // 预发布小于同号正式版
+        assert!(is_newer("1.2.0", "1.2.0-rc.1"));
+        assert!(!is_newer("1.2.0-rc.1", "1.2.0"));
+        // 空值一律当"不可比"
+        assert!(!is_newer("", "1.0.0"));
+        assert!(!is_newer("1.0.0", ""));
+    }
+
+    #[test]
+    fn remove_patch_entry_keeps_comments_and_others() {
+        let patch = "\
+# 顶部注释
+- id: a
+  disabled: true
+
+- id: b
+  disabled: false
+- id: c
+  disabled: true
+";
+        let out = remove_patch_entry(patch, "b").unwrap();
+        assert!(out.contains("# 顶部注释"), "注释要保留");
+        assert!(!out.contains("- id: b"), "被删的条目不该还在");
+        assert!(out.contains("- id: a") && out.contains("- id: c"), "别的条目不受影响");
+        assert_eq!(assert_valid(&out).len(), 2);
+
+        // 再删一个：仍然合法，注释还在
+        let out2 = remove_patch_entry(&out, "a").unwrap();
+        assert_eq!(assert_valid(&out2).len(), 1);
+        assert!(out2.contains("# 顶部注释"));
+        assert!(!out2.contains("- id: a"));
+    }
+
+    /// 删到只剩注释时，YAML 会变成 `null` —— 必须补回空数组 `[]`，
+    /// 否则 DSH 下次启动读不了这个 profile。
+    #[test]
+    fn remove_patch_entry_leaves_valid_empty_document() {
+        let patch = "# 只有注释\n- id: x\n  disabled: true\n";
+        let out = remove_patch_entry(patch, "x").unwrap();
+        assert!(!out.contains("- id: x"));
+        assert!(out.contains("# 只有注释"), "注释保留");
+        assert_eq!(assert_valid(&out).len(), 0, "空文档必须是合法空数组");
+        assert!(out.contains("[]"), "补回 []：\n{}", out);
+        // 空文档上再写一条也还是合法的
+        let back = set_enabled_in_patch(&out, "x", false).unwrap();
+        assert!(is_disabled_in_patch(&back, "x"));
+        assert_eq!(assert_valid(&back).len(), 1);
+    }
+
+    #[test]
+    fn remove_patch_entry_unknown_id_errors() {
+        let patch = "- id: a\n  disabled: false\n";
+        assert!(remove_patch_entry(patch, "nope").is_err());
+    }
+
+    /// 删条目要真的落盘、留备份，且不影响别的条目。
+    #[test]
+    fn clear_patch_entry_at_writes_backup() {
+        let root = fixture("clear-patch");
+        let patch = root.join("profiles").join("web").join("cordis.patch.yml");
+        put(
+            &patch,
+            "# 用户补丁\n- id: keep-me\n  disabled: false\n- id: drop-me\n  disabled: true\n",
+        );
+        clear_patch_entry_at(&patch, "drop-me").unwrap();
+        let after = std::fs::read_to_string(&patch).unwrap();
+        assert!(!after.contains("drop-me"));
+        assert!(after.contains("keep-me"));
+        assert!(after.contains("# 用户补丁"));
+        assert_eq!(assert_valid(&after).len(), 1);
+        assert!(root.join("profiles/web/cordis.patch.yml.bak").is_file(), "改前留备份");
+        // 重复清除同一个 id：报错而不是把文件写坏
+        assert!(clear_patch_entry_at(&patch, "drop-me").is_err());
+        assert_eq!(assert_valid(&std::fs::read_to_string(&patch).unwrap()).len(), 1);
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

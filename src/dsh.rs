@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 
 use crate::config;
+use crate::{tr, trf};
 
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
@@ -203,7 +204,7 @@ fn bin_field(txt: &str) -> Option<String> {
 /// （见 `versions::install_global`），所以这里只有一条解析路径。
 pub fn resolve_entry() -> Result<DshEntry, String> {
     let node = resolve_node().ok_or_else(|| {
-        "未找到 Node.js。请先安装 Node.js（https://nodejs.org，建议 ≥ 18）。".to_string()
+        tr!("未找到 Node.js。请先安装 Node.js（https://nodejs.org，建议 ≥ 18）。").to_string()
     })?;
 
     let mut tried: Vec<String> = Vec::new();
@@ -212,15 +213,17 @@ pub fn resolve_entry() -> Result<DshEntry, String> {
             return Ok(DshEntry {
                 node,
                 entry,
-                source: format!("全局安装 {}", root.display()),
+                source: trf!("全局安装 {}", root.display()),
             });
         }
         tried.push(root.display().to_string());
     }
-    Err(format!(
+    // 先把"检查过的目录"拼好再进 trf!：临时 String 活不过宏那一行
+    let checked = if tried.is_empty() { tr!("（无）").to_string() } else { tried.join("\n  ") };
+    Err(trf!(
         "未找到 DeepSeek Harness 的全局安装。\n已检查：\n  {}\n\n\
          请在「版本」页选一个版本点「安装」，等价于：\n  npm i -g {}@<版本>",
-        if tried.is_empty() { "（无）".to_string() } else { tried.join("\n  ") },
+        checked,
         config::DSH_PACKAGE
     ))
 }
@@ -267,7 +270,7 @@ pub fn cli_runner() -> Result<(PathBuf, Vec<String>), String> {
     if let Some(shim) = which("dsh") {
         return Ok((shim, Vec::new()));
     }
-    Err("未找到 dsh。请在「版本」页安装一个 DSH 版本（全局安装 @deepseek-ai/dsh）。"
+    Err(tr!("未找到 dsh。请在「版本」页安装一个 DSH 版本（全局安装 @deepseek-ai/dsh）。")
         .to_string())
 }
 
@@ -326,8 +329,8 @@ pub fn spawn(entry: &DshEntry, host: &str, port: u16, profile: &str) -> Result<D
         .create(true)
         .append(true)
         .open(&log_path)
-        .map_err(|e| format!("无法写入服务日志 {}: {}", log_path.display(), e))?;
-    let err = out.try_clone().map_err(|e| format!("日志句柄复制失败: {}", e))?;
+        .map_err(|e| trf!("无法写入服务日志 {}: {}", log_path.display(), e))?;
+    let err = out.try_clone().map_err(|e| trf!("日志句柄复制失败: {}", e))?;
 
     {
         let mut f = out.try_clone().map_err(|e| e.to_string())?;
@@ -372,7 +375,7 @@ pub fn spawn(entry: &DshEntry, host: &str, port: u16, profile: &str) -> Result<D
 
     let child = cmd
         .spawn()
-        .map_err(|e| format!("启动 DSH 失败（{}）: {}", entry.node.display(), e))?;
+        .map_err(|e| trf!("启动 DSH 失败（{}）: {}", entry.node.display(), e))?;
     let pid = child.id();
     config::log(&format!(
         "spawned DSH pid={} via {} [{}]",

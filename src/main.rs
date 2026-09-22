@@ -11,6 +11,7 @@
 mod app;
 mod config;
 mod dsh;
+mod i18n;
 mod icon;
 mod plugins;
 mod procs;
@@ -30,6 +31,10 @@ fn main() {
         selftest::run();
         return;
     }
+
+    // 语言要在任何界面文案出现之前定下来（设置里选过就用设置，没选过跟系统区域）
+    let settings = settings::Settings::load();
+    i18n::set(settings.language);
 
     // 单实例：已有实例在运行则直接退出（避免两个启动器抢同一棵 DSH 进程树）
     if !single_instance::acquire() {
@@ -68,7 +73,7 @@ fn main() {
         }),
     ) {
         config::log(&format!("eframe exited with error: {}", e));
-        eprintln!("DSH Launch Console 启动失败: {}", e);
+        eprintln!("{}", crate::trf!("DSH Launch Console 启动失败: {}", e));
     }
 
     config::log("process exiting");

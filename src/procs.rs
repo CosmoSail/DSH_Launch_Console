@@ -6,6 +6,8 @@
 use std::path::Path;
 use std::process::{Command, Stdio};
 
+use crate::trf;
+
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
 
@@ -28,7 +30,7 @@ pub fn run_capture(program: &Path, args: &[&str], cwd: Option<&Path>) -> Result<
     if let Some(d) = cwd {
         c.current_dir(d);
     }
-    let out = c.output().map_err(|e| format!("执行 {} 失败: {}", program.display(), e))?;
+    let out = c.output().map_err(|e| trf!("执行 {} 失败: {}", program.display(), e))?;
     let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
     let err = String::from_utf8_lossy(&out.stderr);
     if !err.trim().is_empty() {

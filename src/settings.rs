@@ -3,6 +3,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::config;
+use crate::i18n::Lang;
 
 /// ✕ 按钮行为。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -50,6 +51,21 @@ pub struct Settings {
     /// 界面风格。加 default 是为了老设置文件（没有这个键）也能正常读出来
     #[serde(default)]
     pub theme: ThemeMode,
+    /// 检查到新版本时**自动更新已装插件**。
+    ///
+    /// - `false`（默认）：只自动检索最新版本，在插件页标出来，点「更新」并确认后才装
+    /// - `true`：检索到新版本直接装（每次运行最多自动跑一轮）
+    ///
+    /// 默认关：插件是用户自己挑的，静默升级不该是默认行为。加 default 同样是为了
+    /// 老设置文件能读出来。
+    #[serde(default)]
+    pub auto_update_plugins: bool,
+    /// 界面语言（中文 / English）。
+    ///
+    /// 老设置文件没有这个键时按中文读（`Lang::default()`）；**全新安装**则跟系统
+    /// 区域走，见 `load()`。
+    #[serde(default)]
+    pub language: Lang,
 }
 
 impl Default for Settings {
@@ -60,6 +76,8 @@ impl Default for Settings {
             close_action: CloseAction::Tray,
             auto_open_browser: true,
             theme: ThemeMode::Light,
+            auto_update_plugins: false,
+            language: Lang::default(),
         }
     }
 }
@@ -71,10 +89,15 @@ impl Settings {
     /// 独立互斥体 + 独立端口并存一个测试实例，绝不碰正在用的会话。
     pub fn load() -> Self {
         let path = config::settings_file();
-        let mut s = std::fs::read_to_string(&path)
+        let mut s = match std::fs::read_to_string(&path)
             .ok()
             .and_then(|t| serde_json::from_str::<Settings>(&t).ok())
-            .unwrap_or_default();
+        {
+            Some(s) => s,
+            // 全新安装（还没有设置文件）：界面语言先跟系统区域走，
+            // 之后一律以下拉框里选的那份为准
+            None => Self { language: Lang::from_system(), ..Default::default() },
+        };
         if let Some(url) = config::env_nonempty("DSH_LAUNCH_CONSOLE_URL") {
             s.url = url;
         }

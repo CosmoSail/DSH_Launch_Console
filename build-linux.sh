@@ -1,10 +1,10 @@
 #!/bin/sh
 # DSH Launch Console — Linux 构建与打包
 # 产出：target/release/dsh-launch-console 二进制
-#       Output/dsh-launch-console_0.2.3_amd64.deb 安装包
+#       Output/dsh-launch-console_0.2.4_amd64.deb 安装包
 set -e
 cd "$(dirname "$0")"
-VERSION=0.2.3
+VERSION=0.2.4
 
 # 1. 编译依赖（Debian/Ubuntu 系；其他发行版请自行安装等价包）
 # 0.2.0 起为原生 GUI（egui/wgpu），不再需要 webkit2gtk；

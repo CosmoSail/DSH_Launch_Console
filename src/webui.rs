@@ -9,6 +9,7 @@ use std::net::{SocketAddr, TcpStream};
 use std::time::Duration;
 
 use crate::config;
+use crate::trf;
 
 /// 用系统默认浏览器打开 URL。
 pub fn open_url(url: &str) -> Result<(), String> {
@@ -25,11 +26,11 @@ pub fn open_url(url: &str) -> Result<(), String> {
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .spawn();
-        r.map(|_| ()).map_err(|e| format!("打开浏览器失败: {}", e))
+        r.map(|_| ()).map_err(|e| trf!("打开浏览器失败: {}", e))
     }
     #[cfg(not(windows))]
     {
-        open::that(url).map_err(|e| format!("打开浏览器失败: {}", e))
+        open::that(url).map_err(|e| trf!("打开浏览器失败: {}", e))
     }
 }
 
@@ -59,10 +60,7 @@ pub fn build_url(base: &str, token: Option<&str>) -> String {
 pub fn open_web_ui(base: &str, token: Option<&str>) -> Result<(), String> {
     let (host, port) = config::url_host_port(base);
     if !listening(&host, port) {
-        return Err(format!(
-            "DSH 尚未运行（{}:{} 无法连接）。请先点击「启动 DeepSeek Harness」。",
-            host, port
-        ));
+        return Err(trf!("DSH 尚未运行（{}:{} 无法连接）。请先点击「启动 DeepSeek Harness」。", host, port));
     }
     open_url(&build_url(base, token))
 }

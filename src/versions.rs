@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::config;
 use crate::procs;
+use crate::{tr, trf};
 
 /// 一个可选版本。
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -122,10 +123,10 @@ pub fn fetch_remote() -> Result<VersionList, String> {
         .get(&url)
         .header("Accept", "application/vnd.npm.install-v1+json, application/json")
         .call()
-        .map_err(|e| format!("无法访问 npm registry: {}", e))?
+        .map_err(|e| trf!("无法访问 npm registry: {}", e))?
         .body_mut()
         .read_json()
-        .map_err(|e| format!("npm registry 返回内容无法解析: {}", e))?;
+        .map_err(|e| trf!("npm registry 返回内容无法解析: {}", e))?;
 
     let mut tags: Vec<(String, String)> = Vec::new();
     if let Some(t) = body.get("dist-tags").and_then(|x| x.as_object()) {
@@ -276,7 +277,7 @@ pub fn version_field(txt: &str) -> Option<String> {
 /// npm 可执行文件路径。
 fn npm_cmd() -> Result<PathBuf, String> {
     crate::dsh::which("npm").ok_or_else(|| {
-        "未找到 npm。DSH 是 Node 应用，请先安装 Node.js（自带 npm）。".to_string()
+        tr!("未找到 npm。DSH 是 Node 应用，请先安装 Node.js（自带 npm）。").to_string()
     })
 }
 
@@ -290,7 +291,7 @@ fn npm_cmd() -> Result<PathBuf, String> {
 pub fn install_global(version: &str, log: &mut dyn FnMut(String)) -> Result<String, String> {
     let npm = npm_cmd()?;
     let spec = format!("{}@{}", config::DSH_PACKAGE, version);
-    log(format!("正在把全局安装切换为 {} …", spec));
+    log(trf!("正在把全局安装切换为 {} …", spec));
 
     let out = procs::hidden_command(&npm)
         .arg("install")
@@ -300,7 +301,7 @@ pub fn install_global(version: &str, log: &mut dyn FnMut(String)) -> Result<Stri
         .arg("--loglevel=error")
         .arg(&spec)
         .output()
-        .map_err(|e| format!("执行 npm 失败: {}", e))?;
+        .map_err(|e| trf!("执行 npm 失败: {}", e))?;
 
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
@@ -309,30 +310,21 @@ pub fn install_global(version: &str, log: &mut dyn FnMut(String)) -> Result<Stri
     }
 
     if !out.status.success() {
-        return Err(format!(
-            "安装失败（npm 退出码 {}）。\n可尝试在终端手动执行：\n  npm i -g {}",
-            out.status.code().unwrap_or(-1),
-            spec
-        ));
+        return Err(trf!("安装失败（npm 退出码 {}）。\n可尝试在终端手动执行：\n  npm i -g {}", out.status.code().unwrap_or(-1),
+            spec));
     }
 
     // 回头验证：全局入口必须还能解析到
     match crate::dsh::resolve_entry() {
         Ok(e) => {
-            let now = installed().global.unwrap_or_else(|| "未知".to_string());
-            log(format!("全局安装现在是 {}（{}）", now, e.entry.display()));
+            let now = installed().global.unwrap_or_else(|| tr!("未知").to_string());
+            log(trf!("全局安装现在是 {}（{}）", now, e.entry.display()));
             if now != version {
-                log(format!(
-                    "提示：npm 报告的版本是 {}，与请求的 {} 不一致，请确认全局前缀与 registry",
-                    now, version
-                ));
+                log(trf!("提示：npm 报告的版本是 {}，与请求的 {} 不一致，请确认全局前缀与 registry", now, version));
             }
         }
         Err(e) => {
-            return Err(format!(
-                "安装完成，但启动器仍解析不到全局入口，请检查 npm 全局前缀：\n{}",
-                e
-            ))
+            return Err(trf!("安装完成，但启动器仍解析不到全局入口，请检查 npm 全局前缀：\n{}", e))
         }
     }
     Ok(spec)
