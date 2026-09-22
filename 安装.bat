@@ -80,7 +80,7 @@ if "%~2"=="" (
 
 :: 控制面板卸载条目（HKCU，无需管理员权限）
 reg add "HKCU\Software\Microsoft\Windows\CurrentVersion\Uninstall\DSH_Launch_Console" /v DisplayName /d "DSH_Launch_Console" /f >nul
-reg add "HKCU\Software\Microsoft\Windows\CurrentVersion\Uninstall\DSH_Launch_Console" /v DisplayVersion /d "0.2.2" /f >nul
+reg add "HKCU\Software\Microsoft\Windows\CurrentVersion\Uninstall\DSH_Launch_Console" /v DisplayVersion /d "0.2.3" /f >nul
 reg add "HKCU\Software\Microsoft\Windows\CurrentVersion\Uninstall\DSH_Launch_Console" /v Publisher /d "DSH" /f >nul
 reg add "HKCU\Software\Microsoft\Windows\CurrentVersion\Uninstall\DSH_Launch_Console" /v InstallLocation /d "!INSTDIR!" /f >nul
 reg add "HKCU\Software\Microsoft\Windows\CurrentVersion\Uninstall\DSH_Launch_Console" /v DisplayIcon /d "!INSTDIR!\DSH_Launch_Console.exe" /f >nul

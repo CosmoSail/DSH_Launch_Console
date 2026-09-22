@@ -16,7 +16,7 @@
 
 ## 下载安装
 
-**[⬇ 下载 DSH_Launch_Console-Setup-0.2.2.exe](https://github.com/CosmoSail/DSH_Launch_Console/releases/latest)**（Windows，5 MB）
+**[⬇ 下载 DSH_Launch_Console-Setup-0.2.3.exe](https://github.com/CosmoSail/DSH_Launch_Console/releases/latest)**（Windows，5 MB）
 
 双击安装即可 —— 按用户安装、**无需管理员权限**，带开始菜单与可选桌面快捷方式，可在「应用」里卸载。
 需要 **Node.js ≥ 18**；DSH 本体没装过也没关系，装好后在「版本」页点「安装」会自动替你装。
@@ -25,9 +25,9 @@
 
 | 文件 | 适用 | 用法 |
 | --- | --- | --- |
-| `DSH_Launch_Console-Setup-0.2.2.exe` | Windows | 双击安装（推荐） |
-| `DSH_Launch_Console-0.2.2-windows-src.zip` | Windows | 解压后双击 `安装.bat` 自行编译安装 |
-| `DSH_Launch_Console-0.2.2-linux.tar.gz` | Linux / macOS | 解压后 `./install.sh`，或 `./build-linux.sh` 打 .deb |
+| `DSH_Launch_Console-Setup-0.2.3.exe` | Windows | 双击安装（推荐） |
+| `DSH_Launch_Console-0.2.3-windows-src.zip` | Windows | 解压后双击 `安装.bat` 自行编译安装 |
+| `DSH_Launch_Console-0.2.3-linux.tar.gz` | Linux / macOS | 解压后 `./install.sh`，或 `./build-linux.sh` 打 .deb |
 
 > 0.2.0 起为原生 OpenGL 渲染，**不需要 WebView2 运行时**。
 
@@ -37,7 +37,7 @@
 | --- | --- |
 | **控制台** | `▶ 启动` / `■ 关闭` DSH；已在运行时再点「启动」只会**在浏览器新开一个 Web UI**，不会重复起服务；运行日志可滚动翻阅 |
 | **版本** | 列出 npm 上 `@deepseek-ai/dsh` 的全部版本与 dist-tag；「安装 / 切换」= `npm i -g @deepseek-ai/dsh@<版本>` |
-| **插件** | 插件市场（4000+，分类显示中文）+ GitHub 搜索；安装 / 卸载 / 启用 / 禁用；「刷新」重扫全部安装途径 |
+| **插件** | 插件市场（4000+，分类显示中文）+ GitHub 搜索；安装 / 卸载 / 启用 / 禁用；「刷新」重扫全部安装途径；已装列表一屏 4 行，多了用滚轮或拖滚动条翻 |
 | **设置** | 风格（浅色 / 深色）、服务地址、Profile、关闭按钮行为、启动后自动打开浏览器 |
 
 **插件来源**：插件页的「刷新」会把下面这些途径一次扫完，并在包名后标出命中的途径（悬停看解释）：
@@ -48,7 +48,7 @@
 | `bundle 层` | 被选进 profile 的 `dsh.profile.bundles`，会加载进 boot graph |
 | `node_modules` / `pnpm 存储` / `兜底目录` | 磁盘上确实存在、但没写进 manifest 的插件（手工拷贝、别的工具装的） |
 | `共享目录` | `<DSH_HOME>/profiles/node_modules` 这类多 profile 共用的目录 |
-| `dsh 自带` | 全局 dsh 安装的平台层，单独折叠显示，不能在这里卸载 |
+| `dsh 自带` | 全局 dsh 安装的平台层，不是用户装的——只计入途径统计，**不在列表里显示** |
 | `补丁引用` | 只在 profile `cordis.patch.yml` 里按 id 出现、找不到对应包的条目 |
 
 启停写的是插件包**自己** `cordis.patch.yml` 里 `insert` 的那些 id；一个包 insert 多行时会一起改

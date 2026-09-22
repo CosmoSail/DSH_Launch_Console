@@ -1,7 +1,7 @@
 ; DSH_Launch_Console — Inno Setup 安装脚本
 ; 按用户安装（无需管理员），开始菜单快捷方式 + 可选桌面快捷方式 + 卸载器
 #define MyAppName "DSH Launch Console"
-#define MyAppVersion "0.2.2"
+#define MyAppVersion "0.2.3"
 #define MyAppExeName "DSH_Launch_Console.exe"
 
 [Setup]

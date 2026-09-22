@@ -113,6 +113,8 @@ pub struct App {
     github_loading: bool,
     /// 最近一次多途径扫描的结果（已装插件 / 平台层 / 补丁条目 / 途径汇总）
     plugin_scan: plugins::ScanReport,
+    /// 已安装插件列表实测的每行高度（点）：用来把列表固定成"一屏 4 行"
+    plugin_row_h: f32,
     plugin_busy: Option<String>,
 
     /// 提示消息 (文本, 是否错误)
@@ -183,6 +185,7 @@ impl App {
             github_results: Vec::new(),
             github_loading: false,
             plugin_scan: plugins::ScanReport::default(),
+            plugin_row_h: PLUGIN_ROW_H_FALLBACK,
             plugin_busy: None,
             toast: None,
             last_output: None,
@@ -1404,9 +1407,18 @@ impl App {
             .show(ui, |ui| {
                 let ctx = ui.ctx().clone();
                 let mut actions = Vec::new();
-                for p in scan.plugins.iter() {
-                    actions.push(installed_row(ui, p, false));
-                }
+                // 固定"一屏 4 行"：多的靠滚轮或拖右侧滚动条气泡翻（见 scroll_rows）。
+                // 行高是上一帧实测出来的，所以换个字号/DPI 也不会把第 4 行截掉。
+                self.plugin_row_h = scroll_rows(
+                    ui,
+                    self.plugin_row_h,
+                    scan.plugins.len(),
+                    |ui| {
+                        for p in scan.plugins.iter() {
+                            actions.push(installed_row(ui, p));
+                        }
+                    },
+                );
                 for a in actions {
                     match a {
                         InstalledAction::None => {}
@@ -1441,7 +1453,7 @@ impl App {
                 let ctx = ui.ctx().clone();
                 let mut actions = Vec::new();
                 for p in scan.patch_rows.iter() {
-                    actions.push(installed_row(ui, p, false));
+                    actions.push(installed_row(ui, p));
                 }
                 for a in actions {
                     match a {
@@ -1456,30 +1468,8 @@ impl App {
             ui.add_space(10.0);
         }
 
-        // —— DSH 自带层：全局安装自带、被这个 profile 选中的层 ——
-        if !scan.builtin.is_empty() {
-            egui::CollapsingHeader::new(
-                egui::RichText::new(format!("DSH 自带层（{}）", scan.builtin.len()))
-                    .size(14.0)
-                    .strong()
-                    .color(theme::text()),
-            )
-            .default_open(false)
-            .show(ui, |ui| {
-                ui.label(
-                    egui::RichText::new(
-                        "由全局 dsh 安装自带、随 profile 选择加载（不是用户装的，也不能在这里卸载）。",
-                    )
-                    .size(12.0)
-                    .color(theme::dim()),
-                );
-                ui.add_space(6.0);
-                for p in scan.builtin.iter() {
-                    let _ = installed_row(ui, p, true);
-                }
-            });
-            ui.add_space(10.0);
-        }
+        // 注意：「dsh 安装自带」的平台层（dsh-base / dsh-web-app 这些）**不在插件页显示**——
+        // 它们不是用户装的插件，扫描时仍然识别（途径汇总里会显示条数），只是不列出来。
 
         // —— 扫描提示 ——
         if !scan.warnings.is_empty() {
@@ -1832,6 +1822,39 @@ enum InstalledAction {
     },
 }
 
+/// 已安装插件一屏显示的行数：超出的靠滚轮 / 拖动滚动条气泡翻。
+const PLUGIN_ROWS_VISIBLE: f32 = 4.0;
+/// 首次绘制时先按这个行高算可视高度，之后用实测值（见 `scroll_rows` 的返回值）。
+const PLUGIN_ROW_H_FALLBACK: f32 = 74.0;
+/// 一行内容的最小高度（按钮行 + id 行）：矮了就把行撑到这个高度，行高才稳定。
+const PLUGIN_ROW_CONTENT_H: f32 = 52.0;
+
+/// 把一组插件行装进"固定 N 行高"的滚动区。
+///
+/// - **滚轮**：`ScrollArea` 自带；指针停在列表上时滚的是这个列表（不会带着整页跑）
+/// - **拖动气泡**：滚动条**沿用全局默认样式**（egui 的悬浮气泡，和运行日志、插件市场
+///   那几处一模一样），不在这里改 `spacing.scroll`——风格要统一；气泡本身可以按住拖
+/// - 行数不足 N 行时按内容收缩，不占空位
+///
+/// 返回**实测的每行高度**（内容总高 ÷ 行数）：字号、DPI、字体回退变了也不会算错，
+/// 调用方把它存下来，下一帧就能用"正好 4 行"的高度。
+fn scroll_rows(
+    ui: &mut egui::Ui,
+    row_h: f32,
+    count: usize,
+    add: impl FnOnce(&mut egui::Ui),
+) -> f32 {
+    let out = egui::ScrollArea::vertical()
+        .max_height(PLUGIN_ROWS_VISIBLE * row_h.max(1.0))
+        .auto_shrink([false, true])
+        .show(ui, add);
+    if count > 0 && out.content_size.y > 0.0 {
+        out.content_size.y / count as f32
+    } else {
+        row_h
+    }
+}
+
 /// 途径标签的配色：登记过的用绿，需要留意的用黄。
 fn route_color(r: PluginRoute) -> egui::Color32 {
     match r {
@@ -1844,8 +1867,9 @@ fn route_color(r: PluginRoute) -> egui::Color32 {
 
 /// 已装插件的一行：包名 + 版本 + 途径标签 + id 行 + 启停/卸载。
 ///
-/// `show_origin` 为真时额外标出"dsh 自带"（给"DSH 自带层"区块用）。
-fn installed_row(ui: &mut egui::Ui, p: &InstalledPlugin, show_origin: bool) -> InstalledAction {
+/// 行高被 `PLUGIN_ROW_CONTENT_H` 固定住（id 行截断成一行），否则字号或长包名一变，
+/// "一屏正好 4 行"就算不准。
+fn installed_row(ui: &mut egui::Ui, p: &InstalledPlugin) -> InstalledAction {
     let mut action = InstalledAction::None;
     egui::Frame::NONE
         .fill(theme::card())
@@ -1853,6 +1877,9 @@ fn installed_row(ui: &mut egui::Ui, p: &InstalledPlugin, show_origin: bool) -> I
         .inner_margin(egui::Margin::symmetric(12, 8))
         .stroke(egui::Stroke::new(1.0, theme::border()))
         .show(ui, |ui| {
+            // 行内两行文字挨紧一点，行高才好预测
+            ui.spacing_mut().item_spacing.y = 4.0;
+            ui.set_min_height(PLUGIN_ROW_CONTENT_H);
             ui.horizontal(|ui| {
                 let name = ui.label(
                     egui::RichText::new(&p.package)
@@ -1865,9 +1892,6 @@ fn installed_row(ui: &mut egui::Ui, p: &InstalledPlugin, show_origin: bool) -> I
                 }
                 if !p.version.is_empty() {
                     ui.label(egui::RichText::new(&p.version).size(12.0).color(theme::dim()));
-                }
-                if show_origin && p.origin == PluginOrigin::Installation {
-                    ui.label(egui::RichText::new("dsh 自带").size(11.5).color(theme::dim()));
                 }
                 // 途径标签：最多显示两个，其余折成 "+N"，悬停看完整解释
                 for r in p.routes.iter().take(2) {
@@ -1902,14 +1926,19 @@ fn installed_row(ui: &mut egui::Ui, p: &InstalledPlugin, show_origin: bool) -> I
                 });
             });
             let warn = p.ids.is_empty() || p.patch_only;
-            let line = ui.label(
-                egui::RichText::new(p.id_line())
-                    .size(12.5)
-                    .color(if warn { theme::warn() } else { theme::dim() }),
+            // 截断成一行（完整内容在悬停里）：id 多的时候换行会把行高顶开
+            let line = ui.add(
+                egui::Label::new(
+                    egui::RichText::new(p.id_line())
+                        .size(12.5)
+                        .color(if warn { theme::warn() } else { theme::dim() }),
+                )
+                .truncate(),
             );
-            if let Some(dir) = &p.dir {
-                line.on_hover_text(dir.display().to_string());
-            }
+            line.on_hover_text(match &p.dir {
+                Some(dir) => format!("{}\n{}", p.id_line(), dir.display()),
+                None => p.id_line(),
+            });
         });
     ui.add_space(4.0);
     action

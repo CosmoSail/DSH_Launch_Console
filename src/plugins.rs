@@ -97,7 +97,7 @@ impl PluginRoute {
             Self::PnpmStore => "位于 pnpm 虚拟存储 .pnpm 里",
             Self::FallbackModules => "DSH 的模块兜底目录 .dsh-module-fallback/node_modules",
             Self::SharedModules => "<DSH_HOME>/profiles/node_modules 共享目录（多个 profile 共用）",
-            Self::Installation => "由全局 dsh 安装自带，不是用户装的",
+            Self::Installation => "由全局 dsh 安装自带、随 profile 选择加载，不是用户装的（插件页不列出这些平台层）",
             Self::PatchOnly => "只在 profile 的 cordis.patch.yml 里被引用，没找到对应包",
         }
     }
