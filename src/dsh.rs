@@ -225,6 +225,36 @@ pub fn resolve_entry() -> Result<DshEntry, String> {
     ))
 }
 
+/// 全局 dsh 包目录（`…/node_modules/@deepseek-ai/dsh`）。
+///
+/// 插件页用它区分"DSH 安装自带、随 profile 选择加载"的平台层与用户自己装的插件。
+/// 先按全局安装根找（不依赖 node 是否存在），找不到再从解析出的入口往上退。
+pub fn dsh_package_dir() -> Option<PathBuf> {
+    let parts: Vec<&str> = config::DSH_PACKAGE.split('/').collect();
+    for root in global_roots() {
+        let mut pkg = root.join("node_modules");
+        for p in &parts {
+            pkg = pkg.join(p);
+        }
+        if pkg.join("package.json").is_file() {
+            return Some(pkg);
+        }
+    }
+    let entry = resolve_entry().ok()?;
+    let mut dir = entry.entry.parent()?.to_path_buf();
+    for _ in 0..4 {
+        if let Ok(txt) = std::fs::read_to_string(dir.join("package.json")) {
+            if let Ok(doc) = serde_json::from_str::<serde_json::Value>(&txt) {
+                if doc.get("name").and_then(|n| n.as_str()) == Some(config::DSH_PACKAGE) {
+                    return Some(dir);
+                }
+            }
+        }
+        dir = dir.parent()?.to_path_buf();
+    }
+    None
+}
+
 /// 执行 dsh CLI 子命令（如 `plugin`）的方式：程序 + 前置参数。
 ///
 /// 优先走解析出来的入口（`node <bin.js> plugin …`）而不是 PATH 上的

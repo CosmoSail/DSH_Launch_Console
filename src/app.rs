@@ -9,7 +9,7 @@ use std::sync::mpsc::{channel, Receiver, Sender};
 use crate::config;
 use crate::dsh::{self, DshInstance};
 use crate::icon;
-use crate::plugins::{self, InstalledPlugin, PluginInfo};
+use crate::plugins::{self, InstalledPlugin, PluginInfo, PluginOrigin, PluginRoute};
 use crate::settings::{CloseAction, Settings, ThemeMode};
 use crate::versions::{self, Installed, VersionList};
 use crate::webui;
@@ -105,11 +105,14 @@ pub struct App {
     /// 插件页
     market: Vec<PluginInfo>,
     market_loaded: bool,
+    /// 市场正在后台重取（刷新按钮点了之后转圈用）
+    market_loading: bool,
     market_query: String,
     market_category: String,
     github_results: Vec<PluginInfo>,
     github_loading: bool,
-    installed_plugins: Vec<InstalledPlugin>,
+    /// 最近一次多途径扫描的结果（已装插件 / 平台层 / 补丁条目 / 途径汇总）
+    plugin_scan: plugins::ScanReport,
     plugin_busy: Option<String>,
 
     /// 提示消息 (文本, 是否错误)
@@ -174,11 +177,12 @@ impl App {
             installing: None,
             market: Vec::new(),
             market_loaded: false,
+            market_loading: false,
             market_query: String::new(),
             market_category: "全部".to_string(),
             github_results: Vec::new(),
             github_loading: false,
-            installed_plugins: Vec::new(),
+            plugin_scan: plugins::ScanReport::default(),
             plugin_busy: None,
             toast: None,
             last_output: None,
@@ -225,11 +229,30 @@ impl App {
     }
 
     fn refresh_plugins(&mut self, ctx: &egui::Context) {
+        self.rescan_plugins();
+        self.reload_market(ctx);
+    }
+
+    /// 重新扫描已装插件。
+    ///
+    /// 扫描只读本地文件（profile 的 package.json / node_modules / cordis.patch.yml
+    /// 与全局 dsh 安装），毫秒级，所以直接在 UI 线程做——点了刷新马上就能看到结果。
+    fn rescan_plugins(&mut self) {
         let profile = self.profile();
-        self.installed_plugins = plugins::installed(&profile);
-        if !self.market_loaded {
-            self.tasks.spawn(ctx, || TaskResult::Market(plugins::fetch_market()));
+        let rep = plugins::scan(&profile);
+        for w in &rep.warnings {
+            config::log(&format!("plugin scan: {}", w));
         }
+        self.plugin_scan = rep;
+    }
+
+    /// 重新抓插件市场（后台线程，旧列表先留在界面上，抓回来再替换）。
+    fn reload_market(&mut self, ctx: &egui::Context) {
+        if self.market_loading {
+            return;
+        }
+        self.market_loading = true;
+        self.tasks.spawn(ctx, || TaskResult::Market(plugins::fetch_market()));
     }
 
     /// 启动 DSH（spawn 很快，同步做；就绪等待交给 poll_dsh 轮询）。
@@ -360,14 +383,12 @@ impl App {
         });
     }
 
-    /// 插件：启用/禁用。
-    fn toggle_plugin(&mut self, ctx: &egui::Context, id: String, enabled: bool) {
+    /// 插件：启用/禁用（一个包可能对应多个 cordis 条目 id，一起改）。
+    fn toggle_plugin(&mut self, ctx: &egui::Context, label: String, ids: Vec<String>, enabled: bool) {
         let profile = self.profile();
-        let label = id.clone();
-        let r = plugins::toggle(&profile, &id, enabled);
-        match r {
+        match plugins::toggle_ids(&profile, &ids, enabled) {
             Ok(()) => {
-                self.installed_plugins = plugins::installed(&profile);
+                self.rescan_plugins();
                 self.toast = Some((
                     format!("{} 已{}", label, if enabled { "启用" } else { "禁用" }),
                     false,
@@ -424,8 +445,10 @@ impl App {
                 TaskResult::Market(Ok(list)) => {
                     self.market = list;
                     self.market_loaded = true;
+                    self.market_loading = false;
                 }
                 TaskResult::Market(Err(e)) => {
+                    self.market_loading = false;
                     self.toast = Some((format!("插件市场加载失败：{}", e), true));
                 }
                 TaskResult::Github(Ok(list)) => {
@@ -450,7 +473,7 @@ impl App {
                         }
                     }
                     self.installed = versions::installed();
-                    self.installed_plugins = plugins::installed(&self.profile());
+                    self.rescan_plugins();
                 }
             }
         }
@@ -1232,7 +1255,21 @@ impl App {
         ui.horizontal(|ui| {
             ui.heading(egui::RichText::new("插件管理").size(21.0).color(theme::text()));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if self.market_loaded {
+                // 刷新：本地重扫（瞬时）+ 后台重抓市场（旧列表先留着）
+                if ui
+                    .button(egui::RichText::new("⟳  刷新").size(14.0))
+                    .on_hover_text(
+                        "重新扫描已装插件（profile 依赖 / bundle 层 / node_modules / pnpm 存储 / \
+                         兜底目录 / 共享目录 / dsh 自带 / 补丁条目），并重新抓取插件市场",
+                    )
+                    .clicked()
+                {
+                    self.rescan_plugins();
+                    self.reload_market(ui.ctx());
+                }
+                if self.market_loading {
+                    ui.spinner();
+                } else if self.market_loaded {
                     ui.label(
                         egui::RichText::new(format!("市场共 {} 个插件", self.market.len()))
                             .size(12.5)
@@ -1250,6 +1287,53 @@ impl App {
             .size(13.0)
             .color(theme::dim()),
         );
+        ui.add_space(4.0);
+
+        // 本次扫描的途径汇总：让"这些插件是怎么进来的"一眼可见
+        let age = self
+            .plugin_scan
+            .scanned_at
+            .map(|t| t.elapsed().as_secs())
+            .map(|s| if s < 5 { "刚刚".to_string() } else { format!("{} 秒前", s) })
+            .unwrap_or_else(|| "尚未扫描".to_string());
+        let roots_hover = format!(
+            "插件是从这些地方找出来的：\n{}",
+            if self.plugin_scan.roots.is_empty() {
+                "（没有可查的目录）".to_string()
+            } else {
+                self.plugin_scan.roots.join("\n")
+            }
+        );
+        ui.horizontal_wrapped(|ui| {
+            ui.label(
+                egui::RichText::new(format!("扫描途径（profile {}，{} 刷新）：", self.plugin_scan.profile, age))
+                    .size(12.0)
+                    .color(theme::dim()),
+            )
+            .on_hover_text(&roots_hover);
+            let hit: Vec<(plugins::PluginRoute, usize)> = self
+                .plugin_scan
+                .counts
+                .iter()
+                .filter(|(_, n)| *n > 0)
+                .cloned()
+                .collect();
+            if hit.is_empty() {
+                ui.label(
+                    egui::RichText::new("（一条途径都没扫到东西）")
+                        .size(11.5)
+                        .color(theme::warn()),
+                );
+            }
+            for (route, n) in hit {
+                ui.label(
+                    egui::RichText::new(format!("{} {}", route.label(), n))
+                        .size(11.5)
+                        .color(theme::accent()),
+                )
+                .on_hover_text(route.hint());
+            }
+        });
         ui.add_space(10.0);
 
         // 搜索行
@@ -1300,75 +1384,114 @@ impl App {
             ui.add_space(8.0);
         }
 
-        // —— 已安装 ——
-        if !self.installed_plugins.is_empty() {
+        // —— 已安装插件（用户装的，可能来自多条途径）——
+        let scan = self.plugin_scan.clone();
+        if scan.plugins.is_empty() {
+            ui.label(
+                egui::RichText::new("没有扫描到已安装的插件。")
+                    .size(13.0)
+                    .color(theme::dim()),
+            );
+            ui.add_space(8.0);
+        } else {
             egui::CollapsingHeader::new(
-                egui::RichText::new(format!("已安装（{}）", self.installed_plugins.len()))
+                egui::RichText::new(format!("已安装插件（{}）", scan.plugins.len()))
                     .size(14.5)
                     .strong()
                     .color(theme::text()),
             )
             .default_open(true)
             .show(ui, |ui| {
-                let list = self.installed_plugins.clone();
-                for p in list.iter() {
-                    egui::Frame::NONE
-                        .fill(theme::card())
-                        .corner_radius(8.0)
-                        .inner_margin(egui::Margin::symmetric(12, 8))
-                        .stroke(egui::Stroke::new(1.0, theme::border()))
-                        .show(ui, |ui| {
-                            ui.horizontal(|ui| {
-                                ui.label(
-                                    egui::RichText::new(&p.package)
-                                        .size(14.0)
-                                        .strong()
-                                        .color(if p.enabled { theme::text() } else { theme::dim() }),
-                                );
-                                if !p.version.is_empty() {
-                                    ui.label(
-                                        egui::RichText::new(&p.version).size(12.0).color(theme::dim()),
-                                    );
-                                }
-                                if p.bundled {
-                                    ui.label(
-                                        egui::RichText::new("bundle").size(11.5).color(theme::accent()),
-                                    );
-                                }
-                                ui.with_layout(
-                                    egui::Layout::right_to_left(egui::Align::Center),
-                                    |ui| {
-                                        if ui.button("卸载").clicked() {
-                                            self.uninstall_plugin(ui.ctx(), p.package.clone());
-                                        }
-                                        if let Some(id) = &p.id {
-                                            let label = if p.enabled { "禁用" } else { "启用" };
-                                            if ui.button(label).clicked() {
-                                                self.toggle_plugin(
-                                                    ui.ctx(),
-                                                    id.clone(),
-                                                    !p.enabled,
-                                                );
-                                            }
-                                        }
-                                    },
-                                );
-                            });
-                            if let Some(id) = &p.id {
-                                ui.label(
-                                    egui::RichText::new(format!("id: {}", id))
-                                        .size(12.5)
-                                        .color(theme::dim()),
-                                );
-                            } else {
-                                ui.label(
-                                    egui::RichText::new("未找到 cordis 插件 id，无法启停")
-                                        .size(12.5)
-                                        .color(theme::warn()),
-                                );
-                            }
-                        });
-                    ui.add_space(4.0);
+                let ctx = ui.ctx().clone();
+                let mut actions = Vec::new();
+                for p in scan.plugins.iter() {
+                    actions.push(installed_row(ui, p, false));
+                }
+                for a in actions {
+                    match a {
+                        InstalledAction::None => {}
+                        InstalledAction::Uninstall(pkg) => self.uninstall_plugin(&ctx, pkg),
+                        InstalledAction::Toggle { label, ids, enabled } => {
+                            self.toggle_plugin(&ctx, label, ids, enabled)
+                        }
+                    }
+                }
+            });
+            ui.add_space(10.0);
+        }
+
+        // —— 补丁条目：cordis.patch.yml 里按 id 引用、但没有对应包的条目 ——
+        if !scan.patch_rows.is_empty() {
+            egui::CollapsingHeader::new(
+                egui::RichText::new(format!("补丁条目（{}）", scan.patch_rows.len()))
+                    .size(14.0)
+                    .strong()
+                    .color(theme::text()),
+            )
+            .default_open(false)
+            .show(ui, |ui| {
+                ui.label(
+                    egui::RichText::new(
+                        "这些 id 出现在 profile 的 cordis.patch.yml 里，但没找到对应的插件包（可能是官方模块的启停行，或插件已被删掉）。",
+                    )
+                    .size(12.0)
+                    .color(theme::dim()),
+                );
+                ui.add_space(6.0);
+                let ctx = ui.ctx().clone();
+                let mut actions = Vec::new();
+                for p in scan.patch_rows.iter() {
+                    actions.push(installed_row(ui, p, false));
+                }
+                for a in actions {
+                    match a {
+                        InstalledAction::None => {}
+                        InstalledAction::Uninstall(pkg) => self.uninstall_plugin(&ctx, pkg),
+                        InstalledAction::Toggle { label, ids, enabled } => {
+                            self.toggle_plugin(&ctx, label, ids, enabled)
+                        }
+                    }
+                }
+            });
+            ui.add_space(10.0);
+        }
+
+        // —— DSH 自带层：全局安装自带、被这个 profile 选中的层 ——
+        if !scan.builtin.is_empty() {
+            egui::CollapsingHeader::new(
+                egui::RichText::new(format!("DSH 自带层（{}）", scan.builtin.len()))
+                    .size(14.0)
+                    .strong()
+                    .color(theme::text()),
+            )
+            .default_open(false)
+            .show(ui, |ui| {
+                ui.label(
+                    egui::RichText::new(
+                        "由全局 dsh 安装自带、随 profile 选择加载（不是用户装的，也不能在这里卸载）。",
+                    )
+                    .size(12.0)
+                    .color(theme::dim()),
+                );
+                ui.add_space(6.0);
+                for p in scan.builtin.iter() {
+                    let _ = installed_row(ui, p, true);
+                }
+            });
+            ui.add_space(10.0);
+        }
+
+        // —— 扫描提示 ——
+        if !scan.warnings.is_empty() {
+            egui::CollapsingHeader::new(
+                egui::RichText::new(format!("扫描提示（{}）", scan.warnings.len()))
+                    .size(13.5)
+                    .color(theme::warn()),
+            )
+            .default_open(false)
+            .show(ui, |ui| {
+                for w in scan.warnings.iter() {
+                    ui.label(egui::RichText::new(format!("· {}", w)).size(12.0).color(theme::dim()));
                 }
             });
             ui.add_space(10.0);
@@ -1403,7 +1526,7 @@ impl App {
                     egui::RichText::new("正在加载插件市场…").size(14.0).color(theme::dim()),
                 );
                 if ui.button("重新加载").clicked() {
-                    self.tasks.spawn(ui.ctx(), || TaskResult::Market(plugins::fetch_market()));
+                    self.reload_market(ui.ctx());
                 }
             });
             return;
@@ -1576,7 +1699,7 @@ impl App {
 
         if changed {
             self.settings.save();
-            self.installed_plugins = plugins::installed(&self.profile());
+            self.rescan_plugins();
             self.toast = Some(("设置已保存".into(), false));
         }
 
@@ -1696,6 +1819,100 @@ fn status_chip(ui: &mut egui::Ui, label: &str, fg: egui::Color32, bg: egui::Colo
         galley,
         fg,
     );
+}
+
+/// 已装插件一行里可发生的动作（绘制结束后统一处理，避免绘制期间可变借用 self）。
+enum InstalledAction {
+    None,
+    Uninstall(String),
+    Toggle {
+        label: String,
+        ids: Vec<String>,
+        enabled: bool,
+    },
+}
+
+/// 途径标签的配色：登记过的用绿，需要留意的用黄。
+fn route_color(r: PluginRoute) -> egui::Color32 {
+    match r {
+        PluginRoute::Dependency => theme::ok(),
+        PluginRoute::BundleLayer | PluginRoute::SharedModules => theme::accent(),
+        PluginRoute::Installation => theme::dim(),
+        _ => theme::warn(),
+    }
+}
+
+/// 已装插件的一行：包名 + 版本 + 途径标签 + id 行 + 启停/卸载。
+///
+/// `show_origin` 为真时额外标出"dsh 自带"（给"DSH 自带层"区块用）。
+fn installed_row(ui: &mut egui::Ui, p: &InstalledPlugin, show_origin: bool) -> InstalledAction {
+    let mut action = InstalledAction::None;
+    egui::Frame::NONE
+        .fill(theme::card())
+        .corner_radius(8.0)
+        .inner_margin(egui::Margin::symmetric(12, 8))
+        .stroke(egui::Stroke::new(1.0, theme::border()))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                let name = ui.label(
+                    egui::RichText::new(&p.package)
+                        .size(14.0)
+                        .strong()
+                        .color(if p.enabled { theme::text() } else { theme::dim() }),
+                );
+                if let Some(dir) = &p.dir {
+                    name.on_hover_text(dir.display().to_string());
+                }
+                if !p.version.is_empty() {
+                    ui.label(egui::RichText::new(&p.version).size(12.0).color(theme::dim()));
+                }
+                if show_origin && p.origin == PluginOrigin::Installation {
+                    ui.label(egui::RichText::new("dsh 自带").size(11.5).color(theme::dim()));
+                }
+                // 途径标签：最多显示两个，其余折成 "+N"，悬停看完整解释
+                for r in p.routes.iter().take(2) {
+                    ui.label(egui::RichText::new(r.label()).size(11.5).color(route_color(*r)))
+                        .on_hover_text(r.hint());
+                }
+                if p.routes.len() > 2 {
+                    ui.label(
+                        egui::RichText::new(format!("+{}", p.routes.len() - 2))
+                            .size(11.0)
+                            .color(theme::dim()),
+                    )
+                    .on_hover_text(p.route_detail());
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    // 自带层不给"卸载"：那是 dsh 安装自己的依赖，删了会把平台拆坏
+                    let removable =
+                        !p.patch_only && p.origin == PluginOrigin::Profile;
+                    if removable && ui.button("卸载").clicked() {
+                        action = InstalledAction::Uninstall(p.package.clone());
+                    }
+                    if !p.ids.is_empty() {
+                        let label = if p.enabled { "禁用" } else { "启用" };
+                        if ui.button(label).clicked() {
+                            action = InstalledAction::Toggle {
+                                label: p.package.clone(),
+                                ids: p.ids.clone(),
+                                enabled: !p.enabled,
+                            };
+                        }
+                    }
+                });
+            });
+            let warn = p.ids.is_empty() || p.patch_only;
+            let line = ui.label(
+                egui::RichText::new(p.id_line())
+                    .size(12.5)
+                    .color(if warn { theme::warn() } else { theme::dim() }),
+            );
+            if let Some(dir) = &p.dir {
+                line.on_hover_text(dir.display().to_string());
+            }
+        });
+    ui.add_space(4.0);
+    action
 }
 
 /// 插件市场一行里可发生的动作。
