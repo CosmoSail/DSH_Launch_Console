@@ -22,7 +22,8 @@
 需要 **Node.js ≥ 18**；DSH 本体没装过也没关系，装好后在「版本」页点「安装」会自动替你装。
 
 也可以从 [Releases](https://github.com/CosmoSail/DSH_Launch_Console/releases) 拿源码包自行编译
-（每个文件旁边附有 SHA-256；自己打包时校验和由 `package.bat` 自动写到 `Output\SHA256SUMS.txt`）：
+（每个文件旁边附有 SHA-256；自己打包时校验和由 `package.bat` 自动写到 `Output\SHA256SUMS.txt`）。
+历史版本的改动说明也都在那里，本文件只描述当前版本：
 
 | 文件 | 适用 | 用法 |
 | --- | --- | --- |
@@ -30,7 +31,7 @@
 | `DSH_Launch_Console-0.2.5-windows-src.zip` | Windows | 解压后双击 `安装.bat` 自行编译安装 |
 | `DSH_Launch_Console-0.2.5-linux.tar.gz` | Linux / macOS | 解压后 `./install.sh`，或 `./build-linux.sh` 打 .deb |
 
-> 0.2.0 起为原生 OpenGL 渲染，**不需要 WebView2 运行时**。
+> 界面是原生 OpenGL 渲染，**不需要 WebView2 运行时**。
 
 ## 功能
 
@@ -71,19 +72,6 @@ npm 页面。GitHub / 本地路径装的包没有可靠的仓库地址，这时�
 **关闭行为**：点 ✕ 可选「最小化到系统托盘」或「直接关闭」，两种都会在退出时**连同 DSH 一起关闭**。
 托盘右键菜单：显示/隐藏窗口、启动/关闭 DSH、打开 Web UI、关闭按钮行为（当前项带勾）、退出。
 
-## 更新日志
-
-| 版本 | 主要变化 |
-| --- | --- |
-| **0.2.5** | 已装插件可一键打开项目仓库；**去掉「补丁条目」**（插件页不再列出、也不再提供手动清除） |
-| 0.2.4 | 界面语言（中文 / English）、插件更新策略与「更新」按钮、「⟳ 刷新」同时重查最新版本（该版加入的「补丁条目」已在 0.2.5 去掉） |
-| 0.2.3 | 不再显示 dsh 自带的平台层；已装插件固定一屏 4 行可滚动 |
-| 0.2.2 | 插件页重做：多途径自动检索、修好插件启停（按插件包自己的 `insert` 行取 id） |
-| 0.2.0 | 去掉 WebView，改为原生 egui 界面；版本管理直接切换全局安装 |
-| 0.1.0 | 首个版本（WebView 界面） |
-
-每个版本的完整说明见 [Releases](https://github.com/CosmoSail/DSH_Launch_Console/releases)。
-
 ## 界面
 
 ![版本管理](docs/03-versions.png)
@@ -120,7 +108,8 @@ cargo build --release
 **版本号只写一处**：项目根 `Cargo.toml` 的 `version`。exe 的「属性 → 详细信息」由
 `build.rs` 在编译期从 cargo 注入的版本号生成，安装向导的版本由打包脚本读出后用
 `ISCC /DMyAppVersion=` 传入，`安装.bat` 的卸载条目、`build-linux.sh` 的 .deb 版本号
-也都在运行时读 `Cargo.toml`——不会出现「界面显示 0.2.5、安装器写 0.2.3」这种漂移。
+也都在运行时读 `Cargo.toml`——改了 `Cargo.toml` 一处，exe 属性、界面侧栏、安装器
+与 .deb 的版本号一起跟上，不会互相漂移。
 
 ## 开发与测试
 
@@ -163,7 +152,7 @@ echo 退出码 %ERRORLEVEL%
 | `DSH-Launch-Console-versions.json` | 版本列表缓存 |
 
 > 设置只有一个真实位置，就是上表那份 JSON——**没有** `DSH_LAUNCH_CONSOLE_STATEDIR`
-> 之类的变量，0.2.0 起也不再创建 `%LOCALAPPDATA%\DSH-Launch-Console`。
+> 之类的变量，程序也不会在 `%LOCALAPPDATA%` 下建自己的数据目录。
 > `tests/` 与 `.dev/` 下的脚本会先把这份设置备份挪走、跑完再原样还原。
 
 ## 常见问题
@@ -175,9 +164,6 @@ echo 退出码 %ERRORLEVEL%
 - **「关闭 DeepSeek Harness」是灰的**：这个 DSH 不是你从启动器启动的（比如终端里敲 `dsh web` 起的）。
   为避免误杀，启动器只结束自己拉起的那棵进程树。
 - **插件装不上，提示找不到 pnpm**：`dsh plugin` 是转发给 pnpm 的，先 `npm i -g pnpm`。
-- **插件页找不到「补丁条目」了**：0.2.5 起去掉了这一项（它管的是配置残留，实际用不上）。
-  原先在列表里显示过的条目就是 profile 的 `cordis.patch.yml` 里按 id 引用、但找不到对应包的
-  那些行，它们一直留在你的配置文件里没被动过，需要的话手工编辑该文件即可。
 - **已装插件没有「仓库」按钮**：这个包没写 `repository` / `homepage`，而且不是从 npm 装的
   （GitHub / 本地路径装的查不到可靠地址）——所以不给按钮，避免点了打不开。
 - **切换版本后行为没变**：切换改的是全局安装那一份，正在运行的 DSH 仍是旧代码——关闭再启动一次。
