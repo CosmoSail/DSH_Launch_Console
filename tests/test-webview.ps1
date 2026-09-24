@@ -1,6 +1,21 @@
 # 验证：① WebView 权限放行（通知/剪贴板）② 同源弹窗 → 壳内轻量窗口
 # 安全：只用改名副本 dsh-lab-web.exe；发现 DSH Launch Console 在运行则直接退出。
 $ErrorActionPreference = 'Stop'
+
+# ── 设置文件护栏 ────────────────────────────────────────────────
+# 0.2.x 的设置只有一个真实位置：%TEMP%\DSH-Launch-Console-settings.json
+# （没有 DSH_LAUNCH_CONSOLE_STATEDIR，也没有自管数据目录）。启动器启动时只读它，
+# 只有界面/托盘里改设置才会写。本脚本跑之前把用户那份挪走，结束后原样还原，
+# 保证测试用的端口 / profile 不会变成用户下次启动时的默认值。
+$TempSettings = Join-Path $env:TEMP 'DSH-Launch-Console-settings.json'
+$TempSettingsBak = "$TempSettings.bak.test"
+$script:HadUserSettings = Test-Path $TempSettings
+if ($script:HadUserSettings) { Copy-Item $TempSettings $TempSettingsBak -Force }
+function Restore-TempState {
+  if ($script:HadUserSettings) { Move-Item $TempSettingsBak $TempSettings -Force -ErrorAction SilentlyContinue }
+  else { Remove-Item $TempSettings -Force -ErrorAction SilentlyContinue }
+}
+# ────────────────────────────────────────────────────────────────
 # 路径约定：本脚本位于 <仓库根>\tests\，$ROOT 取其父目录即仓库根，$PSScriptRoot 即本目录
 $ROOT = Split-Path $PSScriptRoot -Parent
 $PROJ = $ROOT
@@ -63,7 +78,6 @@ Copy-Item $EXE $LABEXE -Force
 
 $T = Join-Path $env:TEMP 'lab-web'
 Remove-Item -Recurse -Force $T -ErrorAction SilentlyContinue
-New-Item -ItemType Directory -Force -Path $T, "$T\state" | Out-Null
 Copy-Item $NODE (Join-Path $T 'node.exe') -Force
 @"
 @ECHO off
@@ -139,7 +153,6 @@ http.createServer((q, s) => {
 '@ | Set-Content -Encoding ASCII (Join-Path $lib 'bin.js')
 
 $env:DSH_LAUNCH_CONSOLE_URL = "http://127.0.0.1:$PORT"
-$env:DSH_LAUNCH_CONSOLE_STATEDIR = "$T\state"
 $env:DSH_LAUNCH_CONSOLE_NOMSGBOX = '1'
 $env:PATH = "$T;$SYS"
 $env:DSH_LAUNCH_CONSOLE_MUTEX = 'DSH_Launch_Console_LabInstance_Mutex'
@@ -174,3 +187,6 @@ Start-Sleep -Seconds 1
 Remove-Item $LABEXE -Force -ErrorAction SilentlyContinue
 Get-NetTCPConnection -LocalPort $PORT -State Listen -ErrorAction SilentlyContinue |
   ForEach-Object { Stop-Process -Id $_.OwningProcess -Force -ErrorAction SilentlyContinue }
+
+# ── 收尾：还原用户设置（详见顶部「设置文件护栏」）─────────────────
+Restore-TempState

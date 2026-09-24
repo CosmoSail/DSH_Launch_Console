@@ -1,12 +1,26 @@
 # 实测我方壳（wry/WebView2）对通知权限的默认处理：
 # mock 页面调用 Notification.requestPermission()，把结果回传到 mock 服务器日志
 $ErrorActionPreference = 'Stop'
+
+# ── 设置文件护栏 ────────────────────────────────────────────────
+# 0.2.x 的设置只有一个真实位置：%TEMP%\DSH-Launch-Console-settings.json
+# （没有 DSH_LAUNCH_CONSOLE_STATEDIR，也没有自管数据目录）。启动器启动时只读它，
+# 只有界面/托盘里改设置才会写。本脚本跑之前把用户那份挪走，结束后原样还原，
+# 保证测试用的端口 / profile 不会变成用户下次启动时的默认值。
+$TempSettings = Join-Path $env:TEMP 'DSH-Launch-Console-settings.json'
+$TempSettingsBak = "$TempSettings.bak.test"
+$script:HadUserSettings = Test-Path $TempSettings
+if ($script:HadUserSettings) { Copy-Item $TempSettings $TempSettingsBak -Force }
+function Restore-TempState {
+  if ($script:HadUserSettings) { Move-Item $TempSettingsBak $TempSettings -Force -ErrorAction SilentlyContinue }
+  else { Remove-Item $TempSettings -Force -ErrorAction SilentlyContinue }
+}
+# ────────────────────────────────────────────────────────────────
 # 路径约定：本脚本位于 <仓库根>\tests\，$ROOT 取其父目录即仓库根，$PSScriptRoot 即本目录
 $ROOT = Split-Path $PSScriptRoot -Parent
 $PROJ = $ROOT
 $T = "$env:TEMP\perm-test"
 Remove-Item -Recurse -Force $T -ErrorAction SilentlyContinue
-New-Item -ItemType Directory -Force -Path $T, "$T\state" | Out-Null
 # 安全护栏：绝不强杀用户正在运行的 DSH Launch Console 实例（只清理实验室副本）
 $live = Get-Process -Name DSH_Launch_Console -ErrorAction SilentlyContinue
 if ($live) { Write-Output "!! DSH Launch Console 正在运行（pid $($live.Id -join ',')）：脚本不会动用户实例，已退出。"; exit 1 }
@@ -45,7 +59,6 @@ node "$T\mock.js"
 
 $env:DSH_LAUNCH_CONSOLE_URL = 'http://127.0.0.1:3199'
 $env:DSH_LAUNCH_CONSOLE_NPX = "$T\npx.cmd"
-$env:DSH_LAUNCH_CONSOLE_STATEDIR = "$T\state"
 $env:DSH_LAUNCH_CONSOLE_NOMSGBOX = '1'
 $env:PATH = "$T;C:\Program Files\nodejs;C:\Windows\system32;C:\Windows"
 $p = Start-Process -FilePath "$PROJ\target\release\dsh-launch-console.exe" -PassThru
@@ -58,3 +71,6 @@ Write-Output "--- mock 收到的请求 ---"
 Get-Content "$T\req.txt" -ErrorAction SilentlyContinue
 Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
 Start-Sleep -Milliseconds 600
+
+# ── 收尾：还原用户设置（详见顶部「设置文件护栏」）─────────────────
+Restore-TempState

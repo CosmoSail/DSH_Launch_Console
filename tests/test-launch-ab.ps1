@@ -1,6 +1,21 @@
 # A/B：新直连链路 vs 旧"隐藏脚本 + shim"链路（同一台机器、同一入口）
 # 指标：进程启动 → mock 服务开始监听 的毫秒数
 $ErrorActionPreference = 'Stop'
+
+# ── 设置文件护栏 ────────────────────────────────────────────────
+# 0.2.x 的设置只有一个真实位置：%TEMP%\DSH-Launch-Console-settings.json
+# （没有 DSH_LAUNCH_CONSOLE_STATEDIR，也没有自管数据目录）。启动器启动时只读它，
+# 只有界面/托盘里改设置才会写。本脚本跑之前把用户那份挪走，结束后原样还原，
+# 保证测试用的端口 / profile 不会变成用户下次启动时的默认值。
+$TempSettings = Join-Path $env:TEMP 'DSH-Launch-Console-settings.json'
+$TempSettingsBak = "$TempSettings.bak.test"
+$script:HadUserSettings = Test-Path $TempSettings
+if ($script:HadUserSettings) { Copy-Item $TempSettings $TempSettingsBak -Force }
+function Restore-TempState {
+  if ($script:HadUserSettings) { Move-Item $TempSettingsBak $TempSettings -Force -ErrorAction SilentlyContinue }
+  else { Remove-Item $TempSettings -Force -ErrorAction SilentlyContinue }
+}
+# ────────────────────────────────────────────────────────────────
 # 路径约定：本脚本位于 <仓库根>\tests\，$ROOT 取其父目录即仓库根，$PSScriptRoot 即本目录
 $ROOT = Split-Path $PSScriptRoot -Parent
 $PROJ = $ROOT
@@ -20,7 +35,6 @@ Get-NetTCPConnection -LocalPort $PORT -State Listen -ErrorAction SilentlyContinu
   ForEach-Object { Stop-Process -Id $_.OwningProcess -Force -ErrorAction SilentlyContinue }
 
 Remove-Item -Recurse -Force $T -ErrorAction SilentlyContinue
-New-Item -ItemType Directory -Force -Path $T, "$T\state" | Out-Null
 Copy-Item $NODE (Join-Path $T 'node.exe') -Force
 @"
 @ECHO off
@@ -58,7 +72,6 @@ srv.listen(port, host, () => fs.writeFileSync(path.join(root, 'listen.txt'), Str
 '@ | Set-Content -Encoding ASCII (Join-Path $lib 'bin.js')
 
 $env:DSH_LAUNCH_CONSOLE_URL = "http://127.0.0.1:$PORT"
-$env:DSH_LAUNCH_CONSOLE_STATEDIR = "$T\state"
 $env:DSH_LAUNCH_CONSOLE_NOMSGBOX = '1'
 $env:PATH = "$T;$SYS"
 
@@ -92,3 +105,6 @@ Remove-Item $LABEXE,$LABEXE_OLD -Force -ErrorAction SilentlyContinue
 Get-NetTCPConnection -LocalPort $PORT -State Listen -ErrorAction SilentlyContinue |
   ForEach-Object { Stop-Process -Id $_.OwningProcess -Force -ErrorAction SilentlyContinue }
 
+
+# ── 收尾：还原用户设置（详见顶部「设置文件护栏」）─────────────────
+Restore-TempState

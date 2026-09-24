@@ -117,7 +117,7 @@ pub struct App {
     market_category: String,
     github_results: Vec<PluginInfo>,
     github_loading: bool,
-    /// 最近一次多途径扫描的结果（已装插件 / 平台层 / 补丁条目 / 途径汇总）
+    /// 最近一次多途径扫描的结果（已装插件 / 平台层 / 途径汇总）
     plugin_scan: plugins::ScanReport,
     /// 已安装插件列表实测的每行高度（点）：用来把列表固定成"一屏 4 行"
     plugin_row_h: f32,
@@ -127,7 +127,7 @@ pub struct App {
     update_checking: bool,
     /// 本次运行是否已经跑过"自动更新"（避免反复重装）
     auto_update_ran: bool,
-    /// 等用户确认的动作（更新插件 / 清除补丁条目）
+    /// 等用户确认的动作（更新插件）
     pending_confirm: Option<ConfirmAction>,
     plugin_busy: Option<String>,
 
@@ -281,7 +281,7 @@ impl App {
             .plugin_scan
             .plugins
             .iter()
-            .filter(|p| !p.patch_only && p.dir.is_some())
+            .filter(|p| p.dir.is_some())
             .map(|p| p.package.clone())
             .collect();
         if names.is_empty() {
@@ -382,22 +382,10 @@ impl App {
         });
     }
 
-    /// 清除补丁里的某个条目（本地改写，写完立刻重扫）。
-    fn clear_patch_entry(&mut self, id: String) {
-        let profile = self.profile();
-        match plugins::clear_patch_entry(&profile, &id) {
-            Ok(()) => {
-                self.rescan_plugins();
-                self.toast = Some((trf!("已清除补丁条目 {}", id), false));
-            }
-            Err(e) => self.toast = Some((e, true)),
-        }
-    }
-
     /// 插件行动作的分发。
     ///
     /// 「更新」在**自动更新关着**的时候要先确认（设置里那句"需要用户确认后才能更新"）；
-    /// 开着就直接装——那是用户自己选的"自动"。「清除补丁条目」是改配置文件，一律先确认。
+    /// 开着就直接装——那是用户自己选的"自动"。
     fn run_installed_action(&mut self, ctx: &egui::Context, a: InstalledAction) {
         match a {
             InstalledAction::None => {}
@@ -412,8 +400,10 @@ impl App {
                     self.pending_confirm = Some(ConfirmAction::Update { package, latest });
                 }
             }
-            InstalledAction::ClearPatch(id) => {
-                self.pending_confirm = Some(ConfirmAction::ClearPatch { id });
+            InstalledAction::OpenRepo(url) => {
+                if let Err(e) = webui::open_url(&url) {
+                    self.toast = Some((e, true));
+                }
             }
         }
     }
@@ -450,7 +440,6 @@ impl App {
                                 ConfirmAction::Update { package, latest } => {
                                     self.update_plugin(&ctx, package, latest)
                                 }
-                                ConfirmAction::ClearPatch { id } => self.clear_patch_entry(id),
                             }
                         }
                     });
@@ -839,15 +828,13 @@ impl eframe::App for App {
             egui::Stroke::new(1.0, theme::border()),
         );
 
-        if self.toast.is_some() {
+        // 提示条配色：tuple 的第二项为 true 表示「这是错误」
+        if let Some((_, is_err)) = self.toast.as_ref() {
+            let bg = if *is_err { theme::err_soft() } else { theme::ok_soft() };
             egui::Panel::bottom("toast")
                 .frame(
                     egui::Frame::NONE
-                        .fill(if self.toast.as_ref().map(|t| t.1).unwrap_or(false) {
-                            theme::err_soft()
-                        } else {
-                            theme::ok_soft()
-                        })
+                        .fill(bg)
                         .inner_margin(egui::Margin::symmetric(16, 12)),
                 )
                 .show(ui, |ui| self.toast_bar(ui));
@@ -1474,7 +1461,7 @@ impl App {
                     .button(egui::RichText::new(tr!("⟳  刷新")).size(14.0))
                     .on_hover_text(
                         tr!("重新扫描已装插件（profile 依赖 / bundle 层 / node_modules / pnpm 存储 / \
-                         兜底目录 / 共享目录 / dsh 自带 / 补丁条目）、重新检查它们的最新版本，\
+                         兜底目录 / 共享目录 / dsh 自带）、重新检查它们的最新版本，\
                          并重新抓取插件市场"),
                     )
                     .clicked()
@@ -1548,7 +1535,7 @@ impl App {
         });
         ui.add_space(10.0);
 
-        // —— 待确认的动作（更新插件 / 清除补丁条目）：写配置前先问一句 ——
+        // —— 待确认的动作（更新插件）：装包之前先问一句 ——
         self.confirm_bar(ui);
 
         // 搜索行
@@ -1637,36 +1624,6 @@ impl App {
                         }
                     },
                 );
-                for a in actions {
-                    self.run_installed_action(&ctx, a);
-                }
-            });
-            ui.add_space(10.0);
-        }
-
-        // —— 补丁条目：cordis.patch.yml 里按 id 引用、但没有对应包的条目 ——
-        if !scan.patch_rows.is_empty() {
-            egui::CollapsingHeader::new(
-                egui::RichText::new(trf!("补丁条目（{}）", scan.patch_rows.len()))
-                    .size(14.0)
-                    .strong()
-                    .color(theme::text()),
-            )
-            .default_open(false)
-            .show(ui, |ui| {
-                ui.label(
-                    egui::RichText::new(
-                        tr!("这些 id 出现在 profile 的 cordis.patch.yml 里，但没找到对应的插件包（可能是官方模块的启停行，或插件已被删掉）。"),
-                    )
-                    .size(12.0)
-                    .color(theme::dim()),
-                );
-                ui.add_space(6.0);
-                let ctx = ui.ctx().clone();
-                let mut actions = Vec::new();
-                for p in scan.patch_rows.iter() {
-                    actions.push(installed_row(ui, p, None));
-                }
                 for a in actions {
                     self.run_installed_action(&ctx, a);
                 }
@@ -2098,8 +2055,8 @@ enum InstalledAction {
         package: String,
         latest: Option<String>,
     },
-    /// 清除补丁里的这个条目
-    ClearPatch(String),
+    /// 在系统浏览器里打开这个插件的项目仓库
+    OpenRepo(String),
 }
 
 /// 需要用户点一下"确认"才会执行的动作（写在配置里的改动，先问一句）。
@@ -2107,8 +2064,6 @@ enum InstalledAction {
 enum ConfirmAction {
     /// 把插件更新到最新版（`latest` 为空表示"更新到最新"，版本号未知）
     Update { package: String, latest: Option<String> },
-    /// 从 cordis.patch.yml 里删掉这个条目
-    ClearPatch { id: String },
 }
 
 impl ConfirmAction {
@@ -2121,7 +2076,6 @@ impl ConfirmAction {
             Self::Update { package, latest: None } => {
                 trf!("把 {} 更新到最新版？", package)
             }
-            Self::ClearPatch { id } => trf!("从 cordis.patch.yml 里清除补丁条目 {}？（会先备份成 .bak）", id),
         }
     }
 
@@ -2129,7 +2083,6 @@ impl ConfirmAction {
     fn ok_label(&self) -> &'static str {
         match self {
             Self::Update { .. } => tr!("确认更新"),
-            Self::ClearPatch { .. } => tr!("清除"),
         }
     }
 }
@@ -2238,17 +2191,6 @@ fn installed_row(
                     .on_hover_text(p.route_detail());
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if p.patch_only {
-                        // 补丁条目：只能手动清除（会先备份 .bak）
-                        if ui
-                            .button(tr!("清除"))
-                            .on_hover_text(tr!("把这个条目从 profile 的 cordis.patch.yml 里删掉"))
-                            .clicked()
-                        {
-                            action = InstalledAction::ClearPatch(p.package.clone());
-                        }
-                        return;
-                    }
                     // 自带层不给"卸载"：那是 dsh 安装自己的依赖，删了会把平台拆坏
                     let removable = p.origin == PluginOrigin::Profile;
                     if removable && ui.button(tr!("卸载")).clicked() {
@@ -2298,9 +2240,20 @@ fn installed_row(
                             latest: latest.map(|s| s.to_string()),
                         };
                     }
+                    // 仓库按钮：地址来自包自己的 package.json（npm 包回落 npm 页面）；
+                    // 取不到地址（GitHub / 本地路径装的）就不给按钮，免得点了打不开
+                    if let Some(repo) = &p.repo {
+                        if ui
+                            .button(tr!("仓库"))
+                            .on_hover_text(trf!("在浏览器打开 {} 的项目仓库：\n{}", p.package, repo))
+                            .clicked()
+                        {
+                            action = InstalledAction::OpenRepo(repo.clone());
+                        }
+                    }
                 });
             });
-            let warn = !p.patch_only && p.ids.is_empty();
+            let warn = p.ids.is_empty();
             // 截断成一行（完整内容在悬停里）：id 多的时候换行会把行高顶开
             let line = ui.add(
                 egui::Label::new(

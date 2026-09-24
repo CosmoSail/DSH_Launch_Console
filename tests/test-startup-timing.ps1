@@ -24,6 +24,21 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+
+# ── 设置文件护栏 ────────────────────────────────────────────────
+# 0.2.x 的设置只有一个真实位置：%TEMP%\DSH-Launch-Console-settings.json
+# （没有 DSH_LAUNCH_CONSOLE_STATEDIR，也没有自管数据目录）。启动器启动时只读它，
+# 只有界面/托盘里改设置才会写。本脚本跑之前把用户那份挪走，结束后原样还原，
+# 保证测试用的端口 / profile 不会变成用户下次启动时的默认值。
+$TempSettings = Join-Path $env:TEMP 'DSH-Launch-Console-settings.json'
+$TempSettingsBak = "$TempSettings.bak.test"
+$script:HadUserSettings = Test-Path $TempSettings
+if ($script:HadUserSettings) { Copy-Item $TempSettings $TempSettingsBak -Force }
+function Restore-TempState {
+  if ($script:HadUserSettings) { Move-Item $TempSettingsBak $TempSettings -Force -ErrorAction SilentlyContinue }
+  else { Remove-Item $TempSettings -Force -ErrorAction SilentlyContinue }
+}
+# ────────────────────────────────────────────────────────────────
 $ROOT    = Split-Path $PSScriptRoot -Parent
 $NODE    = (Get-Command node -ErrorAction SilentlyContinue).Source
 $EXE     = Join-Path $ROOT 'target\release\dsh-launch-console.exe'
@@ -119,7 +134,6 @@ Write-Output ""
 # ---- B 组：经 DSH Launch Console 启动器 -----------------------------------------
 Write-Output "=== B 组：经 DSH Launch Console 启动器 port=$PortLauncher ==="
 $env:DSH_LAUNCH_CONSOLE_URL      = "http://127.0.0.1:$PortLauncher"
-$env:DSH_LAUNCH_CONSOLE_STATEDIR = Join-Path $WORK 'launcher-state'
 $env:DSH_LAUNCH_CONSOLE_MUTEX    = 'DSH_Launch_Console_TimingTest_Mutex'
 $env:DSH_LAUNCH_CONSOLE_NOMSGBOX = '1'
 Remove-Item Env:DSH_LAUNCH_CONSOLE_NPX -ErrorAction SilentlyContinue
@@ -128,8 +142,7 @@ for ($i = 1; $i -le $Runs; $i++) {
   Clear-Port -Port $PortLauncher
   # 不删除用户日志：只记行数偏移，仅回显本轮新增的行
   $logBefore = if (Test-Path $LAUNCHER_LOG) { @(Get-Content $LAUNCHER_LOG).Count } else { 0 }
-  New-Item -ItemType Directory -Force -Path $env:DSH_LAUNCH_CONSOLE_STATEDIR | Out-Null
-  Start-Sleep -Milliseconds 600
+    Start-Sleep -Milliseconds 600
 
   $sw = [System.Diagnostics.Stopwatch]::StartNew()
   $p = Start-Process -FilePath $EXE -PassThru
@@ -178,3 +191,6 @@ Clear-Port -Port $PortDirect
 Clear-Port -Port $PortLauncher
 Write-Output ""
 Write-Output "清理完成；明细日志在 $WORK"
+
+# ── 收尾：还原用户设置（详见顶部「设置文件护栏」）─────────────────
+Restore-TempState

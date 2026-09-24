@@ -34,12 +34,24 @@ Rust 侧的逻辑测试（URL 白名单、token 解析、shim 解析、日志轮
 
 - 一律使用 **改名副本**（`dsh-lab*.exe`）和**独立互斥体**（`DSH_LAUNCH_CONSOLE_MUTEX`），
   因此可以和正在运行的实例并存；
-- 一律使用**独立状态目录**（`DSH_LAUNCH_CONSOLE_STATEDIR`）指向临时目录，不动你的配置；
+- **设置文件护栏**：0.2.x 的设置只有一个真实位置，就是
+  `%TEMP%\DSH-Launch-Console-settings.json`（**没有** `DSH_LAUNCH_CONSOLE_STATEDIR`，
+  也没有自管数据目录）。脚本跑之前会把用户那份备份挪走，结束时原样还原——
+  所以测试用的端口 / profile 不会变成你下次启动时的默认值；
+- 需要跑启动器的脚本，在**顶层**先检查「DSH Launch Console 是否正在运行」，
+  在跑就立刻退出（护栏必须写在任何测试函数之前，贴在函数体里等于没护栏）；
 - 只结束**本脚本自己记录的 PID**，绝不 `taskkill /IM node.exe` 这类按映像名批量杀；
 - 使用 **3197 / 3198 / 3199** 等测试端口；启动耗时系列脚本默认用 **3180 / 3181**，
   并且显式拒绝 3080（真实 DSH 端口）。
 
-运行前请先关闭你自己的 DSH Launch Console，或确认脚本的安全护栏提示后继续。
+`test-isolation-guard.ps1` 单独验证上面那条设置护栏本身（备份 / 还原 / 不残留），
+它不启动启动器、不占端口，随时可以跑：
+
+```powershell
+pwsh -File .\tests\test-isolation-guard.ps1
+```
+
+运行其余脚本前请先关闭你自己的 DSH Launch Console，或确认脚本的安全护栏提示后继续。
 
 ## 脚本一览
 
@@ -48,15 +60,16 @@ Rust 侧的逻辑测试（URL 白名单、token 解析、shim 解析、日志轮
 > 是否还对当前版本有意义；标 ❌ 的是 0.1.0 WebView 时代的产物，
 > 保留只为追溯当时的验证方式，跑它们会得到"功能不存在"的结论。
 
-| 脚本 | 验证内容 | 适用 0.2.0 |
+| 脚本 | 验证内容 | 适用 0.2.x |
 | --- | --- | --- |
+| `test-isolation-guard.ps1` | **设置文件护栏本身**：备份 / 还原 / 不残留（不启动启动器、不占端口） | ✅ |
 | `test-launch.ps1` | 启动链重构：直连包入口、失败分类、npx 回退三条路径 | ❌ npx 回退已不存在 |
 | `test-fastpath.ps1` | 启动速度对比：旧版+npx / 新版+直连 `dsh` / 新版+npx 回退 | ❌ 同上 |
 | `test-launch-ab.ps1` | A/B 对比：新直连链路 vs 旧"隐藏脚本 + shim"链路 | ❌ 对照对象已删除 |
-| `test-window.ps1` | 窗口可见时间（进程启动 → 出现第一个可见顶层窗口） | ⚠️ 思路仍可用，脚本内的基线 exe 名需更新 |
+| `test-window.ps1` | 窗口可见时间（进程启动 → 出现第一个可见顶层窗口） | ❌ 对照的旧版 exe 已不可得 |
 | `test-loading.ps1` | 「窗口先显示 + 启动中页带秒数」：mock DSH 10 秒后才给 token，第 5 秒截图 | ❌ 占位页随 WebView 一起删除 |
 | `probe-icon.ps1` | 像素级校验占位页：找出墨水像素并打印 ASCII 图 | ❌ 同上 |
-| `test-attach.ps1` | 附加模式：DSH 已在运行时只开窗口、退出不杀它 | ✅ 行为仍在，但 0.2.0 是"只开浏览器标签" |
+| `test-attach.ps1` | 附加模式：DSH 已在运行时只开窗口、退出不杀它 | ⚠️ 思路仍在，但 0.2.x 是"只开浏览器标签" |
 | `test-permission.ps1` | WebView2 对通知权限的默认处理 | ❌ 无 WebView |
 | `test-webview.ps1` | WebView 权限放行与同源弹窗 cookie 共享 | ❌ 无 WebView |
 | `test-name2.ps1` | 名称显示：托盘提示文案与托盘右键菜单项 | ⚠️ 托盘菜单仍在，脚本里的旧进程名需更新 |
@@ -64,7 +77,7 @@ Rust 侧的逻辑测试（URL 白名单、token 解析、shim 解析、日志轮
 | `test-startup-io-profile.ps1` | **启动画像**：采样 CPU 时间 / 读取字节 / 工作集 | ✅ |
 | `test-startup-wait-diag.ps1` | **启动等待定位**：观测启动期间的 TCP 连接 | ✅ |
 
-0.2.0 的端到端链路（启动 → 就绪 → token → 整树关闭）由程序自带的
+0.2.x 的端到端链路（启动 → 就绪 → token → 整树关闭）由程序自带的
 `--selftest` 覆盖，不依赖这里的脚本：
 
 ```bat
@@ -77,6 +90,8 @@ DSH_Launch_Console.exe --selftest
 
 ```powershell
 # 在仓库根目录执行
+pwsh -File .\tests\test-isolation-guard.ps1     # 零副作用，先跑这个热身
+
 pwsh -File .\tests\test-launch.ps1
 
 # 启动耗时对照（默认各 2 轮；-Runs 3 提高置信度）
@@ -93,7 +108,9 @@ pwsh -File .\tests\test-startup-timing.ps1 -DshBin 'D:\somewhere\@deepseek-ai\ds
 
 - **启动器几乎不增加开销**：直启 node 与经启动器启动到端口就绪，中位数相差
   约 70 ms（在噪声范围内，方向还是启动器略快）。原因是启动器走 `node <入口>`
-  直连、没有 shell 中间层，而窗口与 WebView2 是在 node 启动之后并行创建的。
+  直连、没有 shell 中间层。（该数据测于 0.1.0，当时窗口与 WebView2 是在 node
+  启动之后并行创建的；0.2.x 换成原生 egui 且窗口先于 DSH 出现，结论只会更有利，
+  但**尚未重测**，引用时请注明出处。）
 - **耗时几乎全在 DSH 自身**：node 启动约 36 ms，参数解析 + profile 组合约 61 ms，
   剩下的约 6.3 秒是 ESM 模块加载与 cordis 插件树挂载。
 - **瓶颈是 CPU 而不是磁盘或网络**：启动期间 CPU 时间 ≈ 墙钟时间（单核打满），

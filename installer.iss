@@ -1,7 +1,20 @@
 ; DSH_Launch_Console — Inno Setup 安装脚本
 ; 按用户安装（无需管理员），开始菜单快捷方式 + 可选桌面快捷方式 + 卸载器
+;
+; 版本号：**不在这里手写**。Cargo.toml 是唯一来源，打包脚本读出来用
+;   ISCC.exe /DMyAppVersion=<版本> installer.iss
+; 传进来。没传时（有人直接跑 ISCC）回落到读 exe 的版本信息——那份也是
+; build.rs 从 Cargo.toml 注入的，所以两条路都指向同一个来源。
+; 回退值是四段式（x.y.z.0），去掉末尾的 .0 才是发布用的三段式。
 #define MyAppName "DSH Launch Console"
-#define MyAppVersion "0.2.4"
+#ifndef MyAppVersion
+  #define MyAppVersion GetVersionNumbersString(AddBackslash(SourcePath) + "DSH_Launch_Console.exe")
+  #if Len(MyAppVersion) > 2
+    #if Copy(MyAppVersion, Len(MyAppVersion) - 1, 2) == ".0"
+      #define MyAppVersion Copy(MyAppVersion, 1, Len(MyAppVersion) - 2)
+    #endif
+  #endif
+#endif
 #define MyAppExeName "DSH_Launch_Console.exe"
 
 [Setup]
@@ -36,6 +49,8 @@ Source: "README.md"; DestDir: "{app}"; Flags: ignoreversion
 Source: "docs\*.png"; DestDir: "{app}\docs"; Flags: ignoreversion
 Source: "installer.iss"; DestDir: "{app}"; Flags: ignoreversion
 Source: "package.bat"; DestDir: "{app}"; Flags: ignoreversion
+; package.bat 的源码包步骤调用它，缺了第 2、3 步会失败
+Source: "make-archives.ps1"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
 Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; IconFilename: "{app}\icon.ico"

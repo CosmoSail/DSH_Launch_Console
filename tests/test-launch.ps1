@@ -1,6 +1,21 @@
 # 启动链重构验证：直连包入口 / 失败分类 / npx 回退
 # 安全约定：只用改名副本 dsh-lab.exe；只按本脚本记录的 PID 结束进程；绝不碰 DSH Launch Console。
 $ErrorActionPreference = 'Stop'
+
+# ── 设置文件护栏 ────────────────────────────────────────────────
+# 0.2.x 的设置只有一个真实位置：%TEMP%\DSH-Launch-Console-settings.json
+# （没有 DSH_LAUNCH_CONSOLE_STATEDIR，也没有自管数据目录）。启动器启动时只读它，
+# 只有界面/托盘里改设置才会写。本脚本跑之前把用户那份挪走，结束后原样还原，
+# 保证测试用的端口 / profile 不会变成用户下次启动时的默认值。
+$TempSettings = Join-Path $env:TEMP 'DSH-Launch-Console-settings.json'
+$TempSettingsBak = "$TempSettings.bak.test"
+$script:HadUserSettings = Test-Path $TempSettings
+if ($script:HadUserSettings) { Copy-Item $TempSettings $TempSettingsBak -Force }
+function Restore-TempState {
+  if ($script:HadUserSettings) { Move-Item $TempSettingsBak $TempSettings -Force -ErrorAction SilentlyContinue }
+  else { Remove-Item $TempSettings -Force -ErrorAction SilentlyContinue }
+}
+# ────────────────────────────────────────────────────────────────
 # 路径约定：本脚本位于 <仓库根>\tests\，$ROOT 取其父目录即仓库根，$PSScriptRoot 即本目录
 $ROOT = Split-Path $PSScriptRoot -Parent
 $PROJ = $ROOT
@@ -23,8 +38,7 @@ function New-Lab {
   param([string]$Name)
   $T = Join-Path $env:TEMP "lab-$Name"
   Remove-Item -Recurse -Force $T -ErrorAction SilentlyContinue
-  New-Item -ItemType Directory -Force -Path $T, "$T\state" | Out-Null
-  Copy-Item $NODE (Join-Path $T 'node.exe') -Force
+    Copy-Item $NODE (Join-Path $T 'node.exe') -Force
   # npm 生成的 dsh.cmd shim（真实格式：%dp0% + 内嵌 lib/bin.js）
   @"
 @ECHO off
@@ -80,7 +94,6 @@ Set-Content -Encoding ASCII (Join-Path $lab.Lib 'bin.js') $mockBody
 Remove-Item $serverLog, $launcherLog -Force -ErrorAction SilentlyContinue
 
 $env:DSH_LAUNCH_CONSOLE_URL = "http://127.0.0.1:$PORT"
-$env:DSH_LAUNCH_CONSOLE_STATEDIR = "$($lab.Dir)\state"
 $env:DSH_LAUNCH_CONSOLE_NOMSGBOX = '1'
 $env:PATH = "$($lab.Dir);$SYS"      # 只有实验室目录 + 系统目录
 Remove-Item Env:DSH_LAUNCH_CONSOLE_NPX -ErrorAction SilentlyContinue
@@ -111,7 +124,6 @@ console.error("Error: listen EADDRINUSE: address already in use 127.0.0.1:3198")
 process.exit(1);
 '@ | Set-Content -Encoding ASCII (Join-Path $lab2.Lib 'bin.js')
 Remove-Item $serverLog, $launcherLog -Force -ErrorAction SilentlyContinue
-$env:DSH_LAUNCH_CONSOLE_STATEDIR = "$($lab2.Dir)\state"
 $env:PATH = "$($lab2.Dir);$SYS"
 $p2 = Start-Process -FilePath $LABEXE -PassThru
 Start-Sleep -Seconds 5
@@ -133,7 +145,6 @@ node "$($lab3.Dir)\mock.js"
 $mockBody2 = $mockBody.Replace('LABTOKEN123456', $TOKEN)
 Set-Content -Encoding ASCII (Join-Path $lab3.Dir 'mock.js') $mockBody2
 Remove-Item $serverLog, $launcherLog -Force -ErrorAction SilentlyContinue
-$env:DSH_LAUNCH_CONSOLE_STATEDIR = "$($lab3.Dir)\state"
 # 屏蔽真实全局安装位置，确保走到 npx 回退分支
 $env:APPDATA = "$($lab3.Dir)\no-appdata"
 $env:LOCALAPPDATA = "$($lab3.Dir)\no-localappdata"
@@ -161,3 +172,6 @@ Get-NetTCPConnection -LocalPort $PORT -State Listen -ErrorAction SilentlyContinu
 Write-Output "  残留 lab 目录:"
 Get-ChildItem "$env:TEMP" -Directory -Filter 'lab-*' -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Name
 
+
+# ── 收尾：还原用户设置（详见顶部「设置文件护栏」）─────────────────
+Restore-TempState

@@ -1,5 +1,25 @@
 # 窗口可见时间测量：进程启动 → 出现第一个可见顶层窗口的毫秒数
 $ErrorActionPreference = 'Stop'
+
+# 安全护栏：绝不强杀用户正在运行的 DSH Launch Console 实例（只清理测试副本）。
+# 必须在顶层、任何测试函数之前执行——贴在函数体里等于没护栏。
+$live = Get-Process -Name DSH_Launch_Console -ErrorAction SilentlyContinue
+if ($live) { Write-Output "!! DSH Launch Console 正在运行（pid $($live.Id -join ',')）：脚本不会动用户实例，已退出。"; exit 1 }
+
+# ── 设置文件护栏 ────────────────────────────────────────────────
+# 0.2.x 的设置只有一个真实位置：%TEMP%\DSH-Launch-Console-settings.json
+# （没有 DSH_LAUNCH_CONSOLE_STATEDIR，也没有自管数据目录）。启动器启动时只读它，
+# 只有界面/托盘里改设置才会写。本脚本跑之前把用户那份挪走，结束后原样还原，
+# 保证测试用的端口 / profile 不会变成用户下次启动时的默认值。
+$TempSettings = Join-Path $env:TEMP 'DSH-Launch-Console-settings.json'
+$TempSettingsBak = "$TempSettings.bak.test"
+$script:HadUserSettings = Test-Path $TempSettings
+if ($script:HadUserSettings) { Copy-Item $TempSettings $TempSettingsBak -Force }
+function Restore-TempState {
+  if ($script:HadUserSettings) { Move-Item $TempSettingsBak $TempSettings -Force -ErrorAction SilentlyContinue }
+  else { Remove-Item $TempSettings -Force -ErrorAction SilentlyContinue }
+}
+# ────────────────────────────────────────────────────────────────
 # 路径约定：本脚本位于 <仓库根>\tests\，$ROOT 取其父目录即仓库根，$PSScriptRoot 即本目录
 $ROOT = Split-Path $PSScriptRoot -Parent
 $PROJ = $ROOT
@@ -48,10 +68,6 @@ function Measure-Window {
   param([string]$Name, [string]$Exe, [string]$Kind, [int]$DelaySec)
   $T = Join-Path $env:TEMP ("win-" + $Name)
   Remove-Item -Recurse -Force $T -ErrorAction SilentlyContinue
-  New-Item -ItemType Directory -Force -Path $T, "$T\state" | Out-Null
-  # 安全护栏：绝不强杀用户正在运行的 DSH Launch Console 实例（只清理实验室副本）
-$live = Get-Process -Name DSH_Launch_Console -ErrorAction SilentlyContinue
-if ($live) { Write-Output "!! DSH Launch Console 正在运行（pid $($live.Id -join ',')）：脚本不会动用户实例，已退出。"; exit 1 }
 Get-Process -Name 'dsh-lab*','dsh-launch-console','dsh-browser' -ErrorAction SilentlyContinue | Stop-Process -Force
   Get-NetTCPConnection -LocalPort 3199 -State Listen -ErrorAction SilentlyContinue |
     ForEach-Object { Stop-Process -Id $_.OwningProcess -Force -ErrorAction SilentlyContinue }
@@ -61,7 +77,6 @@ Get-Process -Name 'dsh-lab*','dsh-launch-console','dsh-browser' -ErrorAction Sil
   Set-Content -Encoding ASCII (Join-Path $T "$Kind.cmd") "@echo off`r`n${delay}node `"$T\mock.js`""
 
   $env:DSH_LAUNCH_CONSOLE_URL = 'http://127.0.0.1:3199'
-  $env:DSH_LAUNCH_CONSOLE_STATEDIR = "$T\state"
   $env:DSH_LAUNCH_CONSOLE_NOMSGBOX = '1'
   $env:MOCK_DIR = $T
   $env:MOCK_TOKEN = 'TESTTOKEN123456'
@@ -91,3 +106,6 @@ Measure-Window -Name 'A-old-npx-2s' -Exe $OLD -Kind 'npx' -DelaySec 2
 Measure-Window -Name 'A2-old-npx-0s' -Exe $OLD -Kind 'npx' -DelaySec 0
 Measure-Window -Name 'B-new-dsh' -Exe $NEW -Kind 'dsh' -DelaySec 0
 Measure-Window -Name 'B2-new-dsh' -Exe $NEW -Kind 'dsh' -DelaySec 0
+
+# ── 收尾：还原用户设置（详见顶部「设置文件护栏」）─────────────────
+Restore-TempState

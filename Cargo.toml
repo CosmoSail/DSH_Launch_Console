@@ -1,6 +1,6 @@
 [package]
 name = "dsh-launch-console"
-version = "0.2.4"
+version = "0.2.5"
 edition = "2021"
 license = "MIT"
 description = "DSH Launch Console: a native GUI launcher that starts DeepSeek Harness with a hidden terminal, opens its Web UI in the system browser, and manages DSH versions and plugins"

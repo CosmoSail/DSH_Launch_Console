@@ -79,8 +79,11 @@ if "%~2"=="" (
 )
 
 :: 控制面板卸载条目（HKCU，无需管理员权限）
+:: 版本号从 Cargo.toml 读，不在脚本里手写（避免与程序实际版本不一致）
+:: delims 里带上空格：Cargo.toml 里是 version = "x.y.z"，否则值会带前导空格与引号
+for /f "usebackq tokens=2 delims== " %%v in (`findstr /b /c:"version" Cargo.toml`) do set "APPVER=%%~v"
 reg add "HKCU\Software\Microsoft\Windows\CurrentVersion\Uninstall\DSH_Launch_Console" /v DisplayName /d "DSH_Launch_Console" /f >nul
-reg add "HKCU\Software\Microsoft\Windows\CurrentVersion\Uninstall\DSH_Launch_Console" /v DisplayVersion /d "0.2.4" /f >nul
+reg add "HKCU\Software\Microsoft\Windows\CurrentVersion\Uninstall\DSH_Launch_Console" /v DisplayVersion /d "!APPVER!" /f >nul
 reg add "HKCU\Software\Microsoft\Windows\CurrentVersion\Uninstall\DSH_Launch_Console" /v Publisher /d "DSH" /f >nul
 reg add "HKCU\Software\Microsoft\Windows\CurrentVersion\Uninstall\DSH_Launch_Console" /v InstallLocation /d "!INSTDIR!" /f >nul
 reg add "HKCU\Software\Microsoft\Windows\CurrentVersion\Uninstall\DSH_Launch_Console" /v DisplayIcon /d "!INSTDIR!\DSH_Launch_Console.exe" /f >nul

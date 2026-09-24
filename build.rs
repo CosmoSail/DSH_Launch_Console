@@ -14,6 +14,11 @@ fn embed_icon_and_version() {
     if std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default() != "windows" {
         return;
     }
+    // 版本号不写死：cargo 会把 Cargo.toml 的 version 注入成 CARGO_PKG_VERSION，
+    // 这里是它唯一的来源。改版本只改 Cargo.toml 一处，属性页/任务管理器跟着变。
+    let ver = std::env::var("CARGO_PKG_VERSION").expect("cargo 必须注入 CARGO_PKG_VERSION");
+    let ver4 = format!("{}.0", ver); // Windows 资源要求四段式 x.y.z.w
+
     let mut res = winres::WindowsResource::new();
     res.set_icon("icon.ico");
     res.set("ProductName", "DSH Launch Console");
@@ -22,8 +27,8 @@ fn embed_icon_and_version() {
     res.set("InternalName", "DSH_Launch_Console");
     res.set("CompanyName", "DSH Launch Console");
     res.set("LegalCopyright", "DSH Launch Console");
-    res.set("FileVersion", "0.2.4.0");
-    res.set("ProductVersion", "0.2.4.0");
+    res.set("FileVersion", &ver4);
+    res.set("ProductVersion", &ver4);
     res.compile().expect("embed icon resource");
 }
 

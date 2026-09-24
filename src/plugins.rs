@@ -9,7 +9,7 @@
 //! `- id: <插件 id>` + `disabled: true/false`。
 //! **改写时按行插入、保留注释**（该文件通常带用户手写注释，不能整体 YAML 重排）。
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -70,8 +70,6 @@ pub enum PluginRoute {
     SharedModules,
     /// 全局 dsh 安装自带（平台层，随 profile 选择加载）
     Installation,
-    /// 只在 profile 的 `cordis.patch.yml` 里被按 id 引用
-    PatchOnly,
 }
 
 impl PluginRoute {
@@ -85,7 +83,6 @@ impl PluginRoute {
             Self::FallbackModules => tr!("兜底目录"),
             Self::SharedModules => tr!("共享目录"),
             Self::Installation => tr!("dsh 自带"),
-            Self::PatchOnly => tr!("补丁引用"),
         }
     }
 
@@ -99,22 +96,7 @@ impl PluginRoute {
             Self::FallbackModules => tr!("DSH 的模块兜底目录 .dsh-module-fallback/node_modules"),
             Self::SharedModules => tr!("<DSH_HOME>/profiles/node_modules 共享目录（多个 profile 共用）"),
             Self::Installation => tr!("由全局 dsh 安装自带、随 profile 选择加载，不是用户装的（插件页不列出这些平台层）"),
-            Self::PatchOnly => tr!("只在 profile 的 cordis.patch.yml 里被引用，没找到对应包"),
         }
-    }
-
-    /// 汇总行里的固定顺序。
-    pub fn all() -> [Self; 8] {
-        [
-            Self::Dependency,
-            Self::BundleLayer,
-            Self::ProfileModules,
-            Self::PnpmStore,
-            Self::FallbackModules,
-            Self::SharedModules,
-            Self::Installation,
-            Self::PatchOnly,
-        ]
     }
 }
 
@@ -131,7 +113,7 @@ pub enum PluginOrigin {
 /// 已安装插件（从 profile 的多条安装途径归并推导）。
 #[derive(Debug, Clone, Default)]
 pub struct InstalledPlugin {
-    /// 包名（`patch_only` 为真时这里是补丁里的 id）
+    /// 包名
     pub package: String,
     /// 可由 profile 补丁启停的 cordis 条目 id（可能多个，如一个包 insert 了多行）
     pub ids: Vec<String>,
@@ -145,8 +127,10 @@ pub struct InstalledPlugin {
     pub routes: Vec<PluginRoute>,
     /// 解析到的包目录
     pub dir: Option<PathBuf>,
-    /// 只是补丁里的一个 id，没有对应的包（不能卸载）
-    pub patch_only: bool,
+    /// 项目仓库地址（供界面上的「仓库」按钮打开）。
+    /// 取自包自己 `package.json` 的 repository / homepage；npm 包取不到时回落
+    /// 到它的 npm 页面（那里一定有仓库链接）。都没有则为空 → 界面不给按钮。
+    pub repo: Option<String>,
 }
 
 impl InstalledPlugin {
@@ -161,9 +145,6 @@ impl InstalledPlugin {
 
     /// 启停状态与 id 的说明行。
     pub fn id_line(&self) -> String {
-        if self.patch_only {
-            return trf!("补丁条目 id: {}", self.package);
-        }
         if !self.ids.is_empty() {
             return trf!("插件 id: {}", self.ids.join(", "));
         }
@@ -297,6 +278,121 @@ fn urlencode(s: &str) -> String {
     out
 }
 
+// ------------------------------------------------------------------ 仓库地址
+
+/// 从已装包的 `package.json` 里取项目仓库地址。
+///
+/// 优先 `repository`，其次 `homepage`，再退到 `bugs.url`。取不到时：
+/// - **npm 包**（普通包名）→ 回落它的 npm 页面，那上面一定有仓库链接
+/// - GitHub / 本地路径等非 npm 规格 → 返回 `None`，界面据此不给「仓库」按钮
+pub fn repo_url(pkg_doc: Option<&serde_json::Value>, spec: &str) -> Option<String> {
+    if let Some(doc) = pkg_doc {
+        for key in ["repository", "homepage"] {
+            if let Some(u) = repo_of_value(doc.get(key)) {
+                return Some(u);
+            }
+        }
+        if let Some(u) = doc.get("bugs").and_then(|b| b.get("url")).and_then(|v| v.as_str()) {
+            if let Some(u) = normalize_repo_url(u) {
+                return Some(u);
+            }
+        }
+    }
+    // 包名形态才拼 npm 地址：`github:owner/repo`、`file:...`、`git+https://…`
+    // 这些装上来的不是 npm 包，拼出来的链接必然是死链。
+    // （作用域包 `@scope/name` 含斜杠但是合法 npm 包名，要放行）
+    let name = spec.trim();
+    if name.is_empty() || name.contains(':') || name.starts_with('.') {
+        return None;
+    }
+    if name.contains('/') && !name.starts_with('@') {
+        return None;
+    }
+    Some(format!("https://www.npmjs.com/package/{}", name))
+}
+
+/// 把 `repository` 字段的两种形态（字符串 / `{type,url}`）都读成字符串。
+fn repo_of_value(v: Option<&serde_json::Value>) -> Option<String> {
+    let v = v?;
+    if let Some(s) = v.as_str() {
+        return normalize_repo_url(s);
+    }
+    let url = v.get("url")?.as_str()?;
+    normalize_repo_url(url)
+}
+
+/// 把 npm 生态里五花八门的仓库写法收敛成可直接打开的 https 地址。
+///
+/// 实测会遇到的形态：
+/// - `git+https://github.com/o/r.git`（最常见）
+/// - `https://github.com/o/r.git`
+/// - `git://github.com/o/r.git`
+/// - `git@github.com:o/r.git`（scp 式）
+/// - `github:o/r`
+/// - `o/r`（GitHub 简写）
+fn normalize_repo_url(raw: &str) -> Option<String> {
+    let mut s = raw.trim().to_string();
+    if s.is_empty() {
+        return None;
+    }
+    // `#readme` / `#main` 这类片段是文档锚点，打开时不需要
+    if let Some(i) = s.find('#') {
+        s.truncate(i);
+    }
+    s = s.trim().to_string();
+    if s.is_empty() {
+        return None;
+    }
+
+    // `git+` 前缀在 git 协议和 scp 式写法上都会出现，先统一剥掉
+    if let Some(rest) = s.strip_prefix("git+") {
+        s = rest.to_string();
+    }
+    // `git://` / `ssh://` 都是 git 自己的传输协议，但 `ssh://` 自带 `git@` 用户段，
+    // 拼成 https 时要去掉，否则会得到打不开的 `https://git@host/…`
+    for scheme in ["git://", "ssh://"] {
+        if let Some(rest) = s.strip_prefix(scheme) {
+            let host = rest.strip_prefix("git@").unwrap_or(rest);
+            s = format!("https://{}", host);
+        }
+    }
+
+    // `github:o/r` / `gitlab:o/r` 这类宿主前缀
+    for prefix in ["github:", "gitlab:", "bitbucket:"] {
+        if let Some(rest) = s.strip_prefix(prefix) {
+            let host = prefix.trim_end_matches(':');
+            s = format!("https://{}.com/{}", host, rest);
+        }
+    }
+
+    // scp 式 `git@host:path`（没有 `//`；冒号在斜杠之前才是 scp，`ssh://…:22/x` 不是）
+    if !s.contains("://") && s.matches(':').count() == 1 && s.contains('@') {
+        if let Some(at) = s.find('@') {
+            let colon = s.find(':').unwrap_or(usize::MAX);
+            if colon > at && !s[at..colon].contains('/') {
+                let host = &s[at + 1..colon];
+                let path = &s[colon + 1..];
+                s = format!("https://{}/{}", host, path);
+            }
+        }
+    }
+
+    // GitHub 简写 `o/r`
+    if !s.contains("://") && s.matches('/').count() == 1 && !s.contains('@') {
+        s = format!("https://github.com/{}", s);
+    }
+
+    s = s.trim_end_matches('/').to_string();
+    if let Some(rest) = s.strip_suffix(".git") {
+        s = rest.to_string();
+    }
+    if s.starts_with("http://") || s.starts_with("https://") {
+        Some(s)
+    } else {
+        None
+    }
+}
+
 /// 分类的中文名。
 ///
 /// 市场数据里的分类键是英文（ui / theme / fun…），**只在显示时翻译**：
@@ -406,8 +502,6 @@ pub struct ScanReport {
     pub plugins: Vec<InstalledPlugin>,
     /// 全局 dsh 安装自带、且被 profile 选中的层（dsh-base / dsh-web-app…）
     pub builtin: Vec<InstalledPlugin>,
-    /// profile 补丁里出现、但找不到对应包的 id
-    pub patch_rows: Vec<InstalledPlugin>,
     /// 每条途径命中了几个包
     pub counts: Vec<(PluginRoute, usize)>,
     /// 扫描过程中的提示（界面折叠显示）
@@ -497,7 +591,6 @@ pub fn scan_with(ctx: &ScanContext, profile: &str) -> ScanReport {
     // ---- 3) 逐个解析目录、补丁、id
     let mut builtin: Vec<InstalledPlugin> = Vec::new();
     let mut plugins: Vec<InstalledPlugin> = Vec::new();
-    let mut claimed_ids: BTreeSet<String> = BTreeSet::new();
     for (name, mut f) in found {
         let resolved = physical
             .get(&name)
@@ -535,11 +628,10 @@ pub fn scan_with(ctx: &ScanContext, profile: &str) -> ScanReport {
             .map(|s| s.to_string())
             .filter(|s| !s.is_empty())
             .unwrap_or(f.version.clone());
+        // 仓库地址：包自己 package.json 里的 repository/homepage（npm 包回落 npm 页面）
+        let repo = repo_url(pkg_doc.as_ref(), &name);
         let enabled = ids.is_empty()
             || !ids.iter().any(|i| is_disabled_in_patch(&profile_patch, i));
-        for i in &ids {
-            claimed_ids.insert(i.clone());
-        }
         let item = InstalledPlugin {
             package: name.clone(),
             ids,
@@ -549,7 +641,7 @@ pub fn scan_with(ctx: &ScanContext, profile: &str) -> ScanReport {
             origin,
             routes: dedup_routes(f.routes),
             dir: pkg_dir,
-            patch_only: false,
+            repo,
         };
         if origin == PluginOrigin::Installation {
             builtin.push(item);
@@ -558,40 +650,20 @@ pub fn scan_with(ctx: &ScanContext, profile: &str) -> ScanReport {
         }
     }
 
-    // ---- 4) profile 补丁里没被任何包认领的 id
-    let mut patch_rows: Vec<InstalledPlugin> = Vec::new();
-    for id in top_level_patch_ids(&profile_patch) {
-        if claimed_ids.contains(&id) {
-            continue;
-        }
-        let enabled = !is_disabled_in_patch(&profile_patch, &id);
-        patch_rows.push(InstalledPlugin {
-            package: id.clone(),
-            ids: vec![id],
-            version: String::new(),
-            enabled,
-            layer: false,
-            origin: PluginOrigin::Profile,
-            routes: vec![PluginRoute::PatchOnly],
-            dir: None,
-            patch_only: true,
-        });
-    }
-
     plugins.sort_by(|a, b| a.package.cmp(&b.package));
     builtin.sort_by(|a, b| a.package.cmp(&b.package));
-    patch_rows.sort_by(|a, b| a.package.cmp(&b.package));
 
+    // 途径汇总：按实际扫到的条数统计。不从「全部途径」遍历——那样每加/删一个
+    // 途径就得同步改汇总表，漏一次就会在界面上留一条永远是 0 的死项。
     let mut counts: BTreeMap<PluginRoute, usize> = BTreeMap::new();
-    for p in plugins.iter().chain(builtin.iter()).chain(patch_rows.iter()) {
+    for p in plugins.iter().chain(builtin.iter()) {
         for r in &p.routes {
             *counts.entry(*r).or_insert(0) += 1;
         }
     }
-    rep.counts = PluginRoute::all().iter().map(|r| (*r, counts.get(r).copied().unwrap_or(0))).collect();
+    rep.counts = counts.into_iter().collect();
     rep.plugins = plugins;
     rep.builtin = builtin;
-    rep.patch_rows = patch_rows;
     rep
 }
 
@@ -726,46 +798,6 @@ fn plugin_ids(dir: &Path, patch_rel: &str, package: &str) -> Vec<String> {
     ids.sort();
     ids.dedup();
     ids
-}
-
-/// profile 补丁里**顶层**的条目 id（insert 块里的不算）。
-fn top_level_patch_ids(patch: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut base: Option<usize> = None;
-    let mut in_insert = false;
-    let mut insert_indent = 0usize;
-    for line in patch.lines() {
-        let t = line.trim();
-        if t.is_empty() || t.starts_with('#') {
-            continue;
-        }
-        let indent = line.len() - line.trim_start().len();
-        if t.starts_with("- insert:") {
-            in_insert = true;
-            insert_indent = indent;
-            continue;
-        }
-        if in_insert {
-            if indent <= insert_indent {
-                in_insert = false;
-            } else {
-                continue;
-            }
-        }
-        if !t.starts_with("- ") {
-            continue;
-        }
-        let b = *base.get_or_insert(indent);
-        if indent != b {
-            continue; // 子行（config: 之类）
-        }
-        if let Some(rest) = t.strip_prefix("- id:") {
-            out.push(clean_scalar(rest));
-        }
-    }
-    out.sort();
-    out.dedup();
-    out
 }
 
 // ------------------------------------------------------------------ 物理扫描与解析
@@ -954,46 +986,6 @@ fn document_line(lines: &[String]) -> Option<usize> {
     })
 }
 
-/// 从 patch 文本里**删掉**某个顶层条目（含它的子行）；返回改写后的文本。
-///
-/// 只动这一个块，其余条目与注释原样保留。删空了（只剩注释）会补一个 `[]`——
-/// 只有注释的 YAML 是 `null`，DSH 下次启动会读不了这个 profile。
-pub fn remove_patch_entry(patch: &str, id: &str) -> Result<String, String> {
-    let lines: Vec<&str> = patch.lines().collect();
-    let Some((start, end)) = block_range(&lines, id) else {
-        return Err(trf!("补丁里没有 id 为 {} 的条目", id));
-    };
-    let mut out: Vec<&str> = Vec::with_capacity(lines.len());
-    out.extend_from_slice(&lines[..start]);
-    // 顺带吃掉紧跟在这个块后面的一个空行，免得反复增删越留越多空行
-    let mut rest = end;
-    if rest < lines.len() && lines[rest].trim().is_empty() {
-        rest += 1;
-    }
-    out.extend_from_slice(&lines[rest..]);
-    let mut text = out.join("\n");
-    if patch.ends_with('\n') {
-        text.push('\n');
-    }
-    Ok(ensure_patch_document(&text))
-}
-
-/// 补丁里没有"文档内容"（只剩注释/空行）时补一个空数组 `[]`。
-fn ensure_patch_document(text: &str) -> String {
-    let has_doc = text
-        .lines()
-        .any(|l| !l.trim().is_empty() && !l.trim_start().starts_with('#'));
-    if has_doc {
-        return text.to_string();
-    }
-    let mut s = text.trim_end().to_string();
-    if !s.is_empty() {
-        s.push('\n');
-    }
-    s.push_str("[]\n");
-    s
-}
-
 /// 设置某插件的启用状态；返回改写后的文本。
 ///
 /// 已存在条目 → 原地改 `disabled:`；不存在 → 追加一个顶层条目。
@@ -1161,25 +1153,6 @@ pub fn uninstall(profile: &str, spec: &str) -> Result<String, String> {
     } else {
         Err(trf!("卸载失败：\n{}", text))
     }
-}
-
-/// 把 profile 补丁里的某个条目整块删掉（留一份 .bak 备份）。
-pub fn clear_patch_entry(profile: &str, id: &str) -> Result<(), String> {
-    clear_patch_entry_at(&patch_file(profile), id)
-}
-
-/// `clear_patch_entry` 的落地版本：直接对某个 `cordis.patch.yml` 生效（便于测试）。
-pub fn clear_patch_entry_at(path: &Path, id: &str) -> Result<(), String> {
-    let path: PathBuf = path.to_path_buf();
-    let original = std::fs::read_to_string(&path).unwrap_or_default();
-    if original.is_empty() {
-        return Err(trf!("{} 还是空的，没有可清除的条目", path.display()));
-    }
-    let updated = remove_patch_entry(&original, id)?;
-    let _ = std::fs::write(Path::new(&format!("{}.bak", path.display())), &original);
-    std::fs::write(&path, updated).map_err(|e| trf!("写入 {} 失败: {}", path.display(), e))?;
-    config::log(&format!("patch entry {} removed from {}", id, path.display()));
-    Ok(())
 }
 
 /// 把「启用/禁用」写回 profile 的 cordis.patch.yml。
@@ -1387,7 +1360,7 @@ mod tests {
     }
 
     /// 一棵"真机上会长成什么样"的目录树：登记过的依赖、pnpm 装的、传递依赖、
-    /// 只带 cordis.patch.yml 的老式插件、dsh 自带层、以及补丁里的孤立 id。
+    /// 只带 cordis.patch.yml 的老式插件、dsh 自带层。
     fn build_fixture(root: &Path) -> ScanContext {
         let home = root.join("home");
         let install = root.join("install").join("node_modules").join("@deepseek-ai").join("dsh");
@@ -1403,6 +1376,8 @@ mod tests {
               "dsh":{"profile":{"bundles":["plugin-a","@scope/plugin-b","@deepseek-ai/dsh-base"]}}
             }"#,
         );
+        // profile 自己的补丁：扫描**不该**把它当成插件列出来
+        // （它只按 id 引用，没有对应包；这里是回归护栏）
         put(
             &home.join("profiles").join("web").join("cordis.patch.yml"),
             "# 用户补丁\n- id: orphan-id\n  disabled: true\n",
@@ -1410,7 +1385,7 @@ mod tests {
         // 1) 登记过的依赖：dsh.bundle.patch 指向随包补丁
         put(
             &home.join("profiles/web/node_modules/plugin-a/package.json"),
-            r#"{"name":"plugin-a","version":"1.2.3","dsh":{"bundle":{"patch":"./cordis.patch.yml"}}}"#,
+            r#"{"name":"plugin-a","version":"1.2.3","repository":{"type":"git","url":"git+https://github.com/acme/plugin-a.git"},"dsh":{"bundle":{"patch":"./cordis.patch.yml"}}}"#,
         );
         put(
             &home.join("profiles/web/node_modules/plugin-a/cordis.patch.yml"),
@@ -1490,13 +1465,6 @@ mod tests {
     }
 
     #[test]
-    fn top_level_ids_ignore_insert_children() {
-        let patch = "# c\n- id: a\n  disabled: false\n- insert:\n    - id: b\n      name: pkg\n";
-        assert_eq!(top_level_patch_ids(patch), vec!["a"]);
-        assert_eq!(top_level_patch_ids("[]\n"), Vec::<String>::new());
-    }
-
-    #[test]
     fn scan_merges_every_route_and_skips_transitive_deps() {
         let root = fixture("scan");
         let ctx = build_fixture(&root);
@@ -1520,6 +1488,10 @@ mod tests {
         assert_eq!(b.ids, vec!["b-layer"]);
         assert!(b.layer);
         assert!(b.routes.contains(&PluginRoute::BundleLayer));
+        // 作用域包没有 repository 字段 → 回落到 npm 页面（作用域包名含斜杠也要认）
+        assert_eq!(b.repo.as_deref(), Some("https://www.npmjs.com/package/@scope/plugin-b"));
+        // plugin-a 写了 repository → 用它，并把 git+….git 收敛成可打开的地址
+        assert_eq!(a.repo.as_deref(), Some("https://github.com/acme/plugin-a"));
 
         // dsh 自带层单独归类
         assert_eq!(rep.builtin.len(), 1);
@@ -1529,13 +1501,6 @@ mod tests {
             rep.builtin[0].ids.is_empty(),
             "官方底座（insert 上百行）绝不能给出可启停 id，否则一次误点就把 DSH 拆了"
         );
-        assert!(!rep.builtin[0].patch_only);
-
-        // 补丁里的孤立 id
-        assert_eq!(rep.patch_rows.len(), 1);
-        assert_eq!(rep.patch_rows[0].package, "orphan-id");
-        assert!(rep.patch_rows[0].patch_only);
-        assert!(!rep.patch_rows[0].enabled, "补丁里写了 disabled: true");
 
         // 途径计数与查过的目录
         let count = |r: PluginRoute| rep.counts.iter().find(|(rr, _)| *rr == r).unwrap().1;
@@ -1544,8 +1509,19 @@ mod tests {
         assert_eq!(count(PluginRoute::BundleLayer), 3);
         assert_eq!(count(PluginRoute::ProfileModules), 2);
         assert_eq!(count(PluginRoute::Installation), 1);
-        assert_eq!(count(PluginRoute::PatchOnly), 1);
         assert!(rep.roots.iter().any(|r| r.contains("profiles")));
+
+        // 0.2.5 起：profile 补丁里按 id 引用、但没有对应包的条目**不再作为插件列出**
+        // （原来会单列成一组"补丁条目"，实际用不上）。它只该影响启停判定，不该出现在列表里。
+        assert!(
+            !names.contains(&"orphan-id"),
+            "补丁里的孤立 id 不该出现在插件列表：{:?}",
+            names
+        );
+        assert!(
+            rep.plugins.iter().all(|p| p.dir.is_some() || p.routes.contains(&PluginRoute::Dependency)),
+            "列表里每一项都应当能落到磁盘上的包"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -1573,19 +1549,17 @@ mod tests {
         println!("counts: {:?}", rep.counts);
         for p in &rep.plugins {
             println!(
-                "  [插件] {} {} ids={:?} enabled={} routes={:?}",
+                "  [插件] {} {} ids={:?} enabled={} routes={:?}\n         仓库={:?}",
                 p.package,
                 p.version,
                 p.ids,
                 p.enabled,
-                p.routes.iter().map(|r| r.label()).collect::<Vec<_>>()
+                p.routes.iter().map(|r| r.label()).collect::<Vec<_>>(),
+                p.repo
             );
         }
         for p in &rep.builtin {
             println!("  [自带] {} {} enabled={}", p.package, p.version, p.enabled);
-        }
-        for p in &rep.patch_rows {
-            println!("  [补丁] {} enabled={}", p.package, p.enabled);
         }
         for w in &rep.warnings {
             println!("  [提示] {}", w);
@@ -1632,7 +1606,7 @@ mod tests {
         assert_eq!(assert_valid(&back).len(), 2);
     }
 
-    // ---------------------------------------------------------- 更新检查 / 清除补丁条目
+    // ---------------------------------------------------------- 更新检查 / 版本比较
 
     #[test]
     fn is_newer_compares_semver() {
@@ -1649,72 +1623,85 @@ mod tests {
         assert!(!is_newer("1.0.0", ""));
     }
 
+    // ---------------------------------------------------------- 仓库地址
+
     #[test]
-    fn remove_patch_entry_keeps_comments_and_others() {
-        let patch = "\
-# 顶部注释
-- id: a
-  disabled: true
-
-- id: b
-  disabled: false
-- id: c
-  disabled: true
-";
-        let out = remove_patch_entry(patch, "b").unwrap();
-        assert!(out.contains("# 顶部注释"), "注释要保留");
-        assert!(!out.contains("- id: b"), "被删的条目不该还在");
-        assert!(out.contains("- id: a") && out.contains("- id: c"), "别的条目不受影响");
-        assert_eq!(assert_valid(&out).len(), 2);
-
-        // 再删一个：仍然合法，注释还在
-        let out2 = remove_patch_entry(&out, "a").unwrap();
-        assert_eq!(assert_valid(&out2).len(), 1);
-        assert!(out2.contains("# 顶部注释"));
-        assert!(!out2.contains("- id: a"));
-    }
-
-    /// 删到只剩注释时，YAML 会变成 `null` —— 必须补回空数组 `[]`，
-    /// 否则 DSH 下次启动读不了这个 profile。
-    #[test]
-    fn remove_patch_entry_leaves_valid_empty_document() {
-        let patch = "# 只有注释\n- id: x\n  disabled: true\n";
-        let out = remove_patch_entry(patch, "x").unwrap();
-        assert!(!out.contains("- id: x"));
-        assert!(out.contains("# 只有注释"), "注释保留");
-        assert_eq!(assert_valid(&out).len(), 0, "空文档必须是合法空数组");
-        assert!(out.contains("[]"), "补回 []：\n{}", out);
-        // 空文档上再写一条也还是合法的
-        let back = set_enabled_in_patch(&out, "x", false).unwrap();
-        assert!(is_disabled_in_patch(&back, "x"));
-        assert_eq!(assert_valid(&back).len(), 1);
+    fn repo_url_normalizes_every_npm_shape() {
+        let cases = [
+            // npm 生态里真实出现过的各种写法 → 都要收敛成可直接打开的 https
+            ("git+https://github.com/o/r.git", "https://github.com/o/r"),
+            ("https://github.com/o/r.git", "https://github.com/o/r"),
+            ("git://github.com/o/r.git", "https://github.com/o/r"),
+            ("git+ssh://git@github.com/o/r.git", "https://github.com/o/r"),
+            ("ssh://git@github.com/o/r.git", "https://github.com/o/r"),
+            ("git@github.com:o/r.git", "https://github.com/o/r"),
+            ("github:o/r", "https://github.com/o/r"),
+            ("o/r", "https://github.com/o/r"),
+            ("https://github.com/o/r#readme", "https://github.com/o/r"),
+            ("https://github.com/o/r/", "https://github.com/o/r"),
+        ];
+        for (input, want) in cases {
+            assert_eq!(
+                normalize_repo_url(input).as_deref(),
+                Some(want),
+                "输入 {:?} 应归一化成 {:?}",
+                input,
+                want
+            );
+        }
+        // 归一化不了的（空、非 http 协议）→ None，界面据此不给按钮
+        assert_eq!(normalize_repo_url(""), None);
+        assert_eq!(normalize_repo_url("   "), None);
+        assert_eq!(normalize_repo_url("ftp://example.com/x"), None);
     }
 
     #[test]
-    fn remove_patch_entry_unknown_id_errors() {
-        let patch = "- id: a\n  disabled: false\n";
-        assert!(remove_patch_entry(patch, "nope").is_err());
-    }
+    fn repo_url_reads_repository_homepage_and_bugs() {
+        let doc = |s: &str| serde_json::from_str::<serde_json::Value>(s).unwrap();
 
-    /// 删条目要真的落盘、留备份，且不影响别的条目。
-    #[test]
-    fn clear_patch_entry_at_writes_backup() {
-        let root = fixture("clear-patch");
-        let patch = root.join("profiles").join("web").join("cordis.patch.yml");
-        put(
-            &patch,
-            "# 用户补丁\n- id: keep-me\n  disabled: false\n- id: drop-me\n  disabled: true\n",
+        // 对象形态的 repository
+        assert_eq!(
+            repo_url(
+                Some(&doc(r#"{"repository":{"type":"git","url":"git+https://github.com/o/r.git"}}"#)),
+                "o-r"
+            )
+            .as_deref(),
+            Some("https://github.com/o/r")
         );
-        clear_patch_entry_at(&patch, "drop-me").unwrap();
-        let after = std::fs::read_to_string(&patch).unwrap();
-        assert!(!after.contains("drop-me"));
-        assert!(after.contains("keep-me"));
-        assert!(after.contains("# 用户补丁"));
-        assert_eq!(assert_valid(&after).len(), 1);
-        assert!(root.join("profiles/web/cordis.patch.yml.bak").is_file(), "改前留备份");
-        // 重复清除同一个 id：报错而不是把文件写坏
-        assert!(clear_patch_entry_at(&patch, "drop-me").is_err());
-        assert_eq!(assert_valid(&std::fs::read_to_string(&patch).unwrap()).len(), 1);
-        let _ = std::fs::remove_dir_all(&root);
+        // 字符串形态的 repository
+        assert_eq!(
+            repo_url(Some(&doc(r#"{"repository":"https://github.com/o/s"}"#)), "o-s").as_deref(),
+            Some("https://github.com/o/s")
+        );
+        // repository 没法归一化 → 退到 homepage
+        assert_eq!(
+            repo_url(
+                Some(&doc(r#"{"repository":{"url":"ftp://nope"},"homepage":"https://example.com/h"}"#)),
+                "p"
+            )
+            .as_deref(),
+            Some("https://example.com/h")
+        );
+        // 只有 bugs → 用 bugs.url
+        assert_eq!(
+            repo_url(Some(&doc(r#"{"bugs":{"url":"https://github.com/o/t/issues"}}"#)), "p")
+                .as_deref(),
+            Some("https://github.com/o/t/issues")
+        );
+        // 什么都没有的 npm 包 → 回落 npm 页面；作用域包也要认
+        assert_eq!(
+            repo_url(Some(&doc(r#"{"name":"plain"}"#)), "plain").as_deref(),
+            Some("https://www.npmjs.com/package/plain")
+        );
+        assert_eq!(
+            repo_url(None, "@scope/name").as_deref(),
+            Some("https://www.npmjs.com/package/@scope/name")
+        );
+        // 非 npm 规格（GitHub / 本地路径）→ 不给链接，免得拼出死链
+        assert_eq!(repo_url(None, "github:o/r"), None);
+        assert_eq!(repo_url(None, "git+https://github.com/o/r.git"), None);
+        assert_eq!(repo_url(None, "file:../local-plugin"), None);
+        assert_eq!(repo_url(None, "."), None);
+        assert_eq!(repo_url(None, ""), None);
     }
 }
