@@ -17,6 +17,13 @@
 #endif
 #define MyAppExeName "DSH_Launch_Console.exe"
 
+; 要打包进去的 exe。默认是仓库根那份便携副本；打包脚本在便携副本被占用
+; （用户正开着它）时会用 /DMyAppExe=<临时文件> 送一份新编译的进来，
+; 免得因为一个文件锁就悄悄打出旧版本的安装包。
+#ifndef MyAppExe
+  #define MyAppExe "DSH_Launch_Console.exe"
+#endif
+
 [Setup]
 AppId={{4764FC99-FEE0-48B7-8B83-115578E612DE}
 AppName={#MyAppName}
@@ -42,7 +49,7 @@ Name: "chinesesimplified"; MessagesFile: "compiler:Languages\ChineseSimplified.i
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"
 
 [Files]
-Source: "DSH_Launch_Console.exe"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#MyAppExe}"; DestDir: "{app}"; DestName: "{#MyAppExeName}"; Flags: ignoreversion
 Source: "icon.ico"; DestDir: "{app}"; Flags: ignoreversion
 Source: "README.md"; DestDir: "{app}"; Flags: ignoreversion
 ; README 里的截图，缺了会变成坏链

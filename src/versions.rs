@@ -330,6 +330,78 @@ pub fn install_global(version: &str, log: &mut dyn FnMut(String)) -> Result<Stri
     Ok(spec)
 }
 
+/// 卸载**全局安装**（阻塞，调用方放后台线程）。
+///
+/// 就是 `npm uninstall -g @deepseek-ai/dsh`：全局那份连同 `dsh` 命令一起消失。
+/// 后果要说清楚——**全局实例**（以及命令行 `dsh`、自检）就没得跑了，
+/// 直到重新装一个。所以界面上的按钮走确认流程。
+///
+/// 不动任何自建实例自己的版本目录（那些在 `instances\<id>\versions\` 下）。
+pub fn uninstall_global(log: &mut dyn FnMut(String)) -> Result<String, String> {
+    let npm = npm_cmd()?;
+    let spec = config::DSH_PACKAGE;
+    let before = installed().global;
+    log(trf!("正在卸载全局安装 {} …", spec));
+
+    let out = procs::hidden_command(&npm)
+        .arg("uninstall")
+        .arg("-g")
+        .arg("--no-audit")
+        .arg("--no-fund")
+        .arg("--loglevel=error")
+        .arg(spec)
+        .output()
+        .map_err(|e| trf!("执行 npm 失败: {}", e))?;
+    for line in String::from_utf8_lossy(&out.stderr)
+        .lines()
+        .chain(String::from_utf8_lossy(&out.stdout).lines())
+        .filter(|l| !l.trim().is_empty())
+    {
+        log(format!("  {}", line));
+    }
+    if !out.status.success() {
+        return Err(trf!(
+            "卸载失败（npm 退出码 {}）。\n可尝试在终端手动执行：\n  npm uninstall -g {}",
+            out.status.code().unwrap_or(-1),
+            spec
+        ));
+    }
+
+    // 回头验证：入口应当解析不到了。还解析得到 → 有别的来源（比如 PATH 上另有一份），
+    // 这时候报出来，别让用户以为"卸干净了"。
+    if crate::dsh::resolve_entry().is_ok() {
+        return Err(trf!(
+            "卸载命令成功了，但启动器仍能解析到 dsh 入口——你的 PATH 上可能还有另一份安装，请手动确认。"
+        ));
+    }
+    Ok(match before {
+        Some(v) => trf!("已卸载全局安装（原版本 {}）", v),
+        None => tr!("已卸载全局安装").to_string(),
+    })
+}
+
+/// 卸载**某个实例自己装的**某个版本（删它的版本目录）。
+///
+/// 只动 `<data>/instances/<id>/versions/<版本>` 这一层，不碰该实例的 DSH_HOME，
+/// 也不碰别的实例。删不掉（版本正在跑、Windows 文件占用）时返回错误，
+/// 不假装成功——否则界面上"已卸载"但磁盘上还占着几百 MB。
+pub fn uninstall_managed(instance: &str, version: &str) -> Result<(), String> {
+    if !config::is_safe_version(version) {
+        return Err(trf!("版本号不合法: {}", version));
+    }
+    let dir = config::instance_version_dir(instance, version);
+    if !dir.exists() {
+        return Ok(());
+    }
+    std::fs::remove_dir_all(&dir).map_err(|e| {
+        format!(
+            "删不掉 {}：{}\n（若这个版本正在运行，请先关闭该实例）",
+            dir.display(),
+            e
+        )
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

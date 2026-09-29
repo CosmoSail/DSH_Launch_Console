@@ -25,10 +25,26 @@ pub fn hidden_command(program: &Path) -> Command {
 
 /// 隐藏执行并等待，返回 (成功, 合并输出)。
 pub fn run_capture(program: &Path, args: &[&str], cwd: Option<&Path>) -> Result<(bool, String), String> {
+    run_capture_env(program, args, cwd, &[])
+}
+
+/// 带环境变量覆盖的版本。
+///
+/// 多实例要靠 `DSH_HOME` 把插件命令指到某个实例自己的主目录，
+/// 否则 `dsh plugin add` 会装到全局 `~/.dsh`——几个实例就串在一起了。
+pub fn run_capture_env(
+    program: &Path,
+    args: &[&str],
+    cwd: Option<&Path>,
+    envs: &[(&str, &Path)],
+) -> Result<(bool, String), String> {
     let mut c = hidden_command(program);
     c.args(args);
     if let Some(d) = cwd {
         c.current_dir(d);
+    }
+    for (k, v) in envs {
+        c.env(k, v);
     }
     let out = c.output().map_err(|e| trf!("执行 {} 失败: {}", program.display(), e))?;
     let mut text = String::from_utf8_lossy(&out.stdout).into_owned();

@@ -157,10 +157,15 @@ pub struct DshEntry {
     pub source: String,
 }
 
-/// 在指定的安装目录里定位 `@deepseek-ai/dsh` 的 bin.js。
+/// 在指定的安装根目录里定位 `@deepseek-ai/dsh` 的 bin.js。
 /// `root` 指向 `node_modules` 的父目录（即 npm 全局 prefix）。
 pub fn entry_in_dir(root: &Path) -> Option<PathBuf> {
-    let pkg = root.join("node_modules").join("@deepseek-ai").join("dsh");
+    entry_in_node_modules(&root.join("node_modules"))
+}
+
+/// 在某个 `node_modules` 目录里定位 `@deepseek-ai/dsh` 的 bin.js。
+pub fn entry_in_node_modules(node_modules: &Path) -> Option<PathBuf> {
+    let pkg = node_modules.join("@deepseek-ai").join("dsh");
     // package.json 的 bin 字段优先
     if let Ok(txt) = std::fs::read_to_string(pkg.join("package.json")) {
         if let Some(rel) = bin_field(&txt) {
@@ -177,6 +182,139 @@ pub fn entry_in_dir(root: &Path) -> Option<PathBuf> {
         }
     }
     None
+}
+
+// ---------------------------------------------------------------- 自管版本
+
+/// 启动器自管的版本目录：`<app_data>/versions/<版本>`。
+///
+/// 多实例要能同时跑不同版本，就得有一份「第二个版本」放在本地。
+/// 装在自管目录里而不是改全局安装，是为了不碰用户原本那份
+/// （切换全局版本仍是「版本」页里的事）。
+///
+/// 多实例要能同时跑不同版本，就得有一份「第二个版本」放在本地。
+/// 装在**这个实例自己的目录**里而不是改全局安装，既不碰用户原本那份、
+/// 也不和其它实例共用（删掉这个实例时，它装的版本跟着一起删干净）。
+pub fn installed_managed_version(instance: &str, version: &str) -> Option<PathBuf> {
+    if !config::is_safe_version(version) {
+        return None;
+    }
+    let dir = config::instance_version_dir(instance, version);
+    for rel in ["lib/bin.js", "bin.js", "dist/bin.js"] {
+        let cand = dir.join("node_modules").join(config::DSH_PACKAGE).join(rel);
+        if cand.is_file() {
+            return Some(cand);
+        }
+    }
+    entry_in_node_modules(&dir.join("node_modules"))
+}
+
+/// 某个实例自己装了哪些版本（读目录名，不读 package.json）。
+pub fn managed_versions(instance: &str) -> Vec<String> {
+    let dir = config::instance_versions_dir(instance);
+    let Ok(rd) = std::fs::read_dir(&dir) else {
+        return Vec::new();
+    };
+    let mut out: Vec<String> = rd
+        .flatten()
+        .filter(|e| e.path().is_dir())
+        .filter_map(|e| e.file_name().to_str().map(|s| s.to_string()))
+        .filter(|v| installed_managed_version(instance, v).is_some())
+        .collect();
+    out.sort();
+    out
+}
+
+/// 把某个版本装进**某个实例自己的**版本目录。`node` 用来跑 npm。
+///
+/// 用 `npm install --prefix <目录>` 而不是 `npm i -g`：目标是「就地装一份、
+/// 不碰全局」，`--prefix` 正好是这个语义，且不依赖 pnpm。
+pub fn install_managed_version(
+    instance: &str,
+    node: &Path,
+    version: &str,
+    mut log: impl FnMut(String),
+) -> Result<PathBuf, String> {
+    if !config::is_safe_version(version) {
+        return Err(trf!("版本号不合法，不能用来做目录名: {}", version));
+    }
+    let dir = config::instance_version_dir(instance, version);
+    let npm = npm_cli(node).ok_or_else(|| {
+        tr!("未找到 npm。装指定版本的 DSH 需要 npm（Node.js 自带），请检查 Node.js 安装。")
+            .to_string()
+    })?;
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| trf!("创建版本目录失败 {}: {}", dir.display(), e))?;
+
+    let spec = format!("{}@{}", config::DSH_PACKAGE, version);
+    log(trf!("npm install --prefix {} {}", dir.display(), spec));
+
+    // npm 在 Windows 上是 npm.cmd；走 shim 时**不要**再套 cmd /C——
+    // 直接执行 .cmd 是可行的，套一层反而会把引号弄乱。
+    let mut cmd = crate::procs::hidden_command(&npm);
+    cmd.arg("install")
+        .arg("--prefix")
+        .arg(&dir)
+        .arg("--no-audit")
+        .arg("--no-fund")
+        .arg("--loglevel")
+        .arg("error")
+        .arg(&spec);
+    let out = cmd
+        .output()
+        .map_err(|e| trf!("执行 npm 失败（{}）: {}", npm.display(), e))?;
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    for line in stdout.lines().chain(stderr.lines()) {
+        if !line.trim().is_empty() {
+            log(line.trim().to_string());
+        }
+    }
+    if !out.status.success() {
+        let code = out
+            .status
+            .code()
+            .map(|c| c.to_string())
+            .unwrap_or_else(|| tr!("被信号结束").to_string());
+        return Err(trf!(
+            "安装 {} 失败（npm 退出码 {}）。\n{}",
+            spec,
+            code,
+            stderr.trim()
+        ));
+    }
+    installed_managed_version(instance, version)
+        .ok_or_else(|| trf!("npm 报成功，但没找到 {} 的入口——安装可能不完整", spec))
+}
+
+/// 找到 npm 可执行文件：与 node 同目录优先（官方安装包/nvm/scoop 都是这样），
+/// 再退回 PATH。与 node 同目录优先能避免"node 来自 A、npm 来自 B"这种错配。
+pub fn npm_cli(node: &Path) -> Option<PathBuf> {
+    if let Some(dir) = node.parent() {
+        for name in npm_names() {
+            let cand = dir.join(name);
+            if cand.is_file() {
+                return Some(cand);
+            }
+        }
+    }
+    for name in npm_names() {
+        if let Some(p) = which(name) {
+            return Some(p);
+        }
+    }
+    None
+}
+
+fn npm_names() -> &'static [&'static str] {
+    #[cfg(windows)]
+    {
+        &["npm.cmd", "npm.exe", "npm"]
+    }
+    #[cfg(not(windows))]
+    {
+        &["npm"]
+    }
 }
 
 /// 从 package.json 文本里取 `bin` 的 dsh 入口（字符串或对象形式）。
@@ -228,6 +366,53 @@ pub fn resolve_entry() -> Result<DshEntry, String> {
     ))
 }
 
+/// 解析入口，并按**实例**要求的版本选一份安装。
+///
+/// `version` 的语义：
+/// - `None` 或空串 → 用**全局安装**那一份（全局实例走的就是这条）
+/// - 具体版本号 → 用**这个实例自己目录里**已装的那份；没装则报错并提示先安装
+///   （自动安装由调用方在后台做，因为它要下载几百 MB，不能卡在 UI 线程里）
+pub fn resolve_entry_for(instance: &str, version: Option<&str>) -> Result<DshEntry, String> {
+    let want = version.map(|s| s.trim()).filter(|s| !s.is_empty());
+    let Some(ver) = want else {
+        return resolve_entry();
+    };
+    if !config::is_safe_version(ver) {
+        return Err(trf!("版本号不合法: {}", ver));
+    }
+    let node = resolve_node().ok_or_else(|| {
+        tr!("未找到 Node.js。请先安装 Node.js（https://nodejs.org，建议 ≥ 18）。").to_string()
+    })?;
+
+    if let Some(entry) = installed_managed_version(instance, ver) {
+        return Ok(DshEntry {
+            node,
+            entry,
+            source: trf!("实例自带版本 {}", ver),
+        });
+    }
+    // 这个实例没装，但恰好等于全局安装的版本 → 直接用全局那份，不必重复下载。
+    // 全局实例本来就走这条；自建实例撞上同一版本时也能省下一份几百 MB 的拷贝。
+    if let Ok(global) = resolve_entry() {
+        if global_version()?.as_deref() == Some(ver) {
+            return Ok(global);
+        }
+    }
+    Err(trf!(
+        "这个实例没装 {ver}。\n请在「版本」页把它装给这个实例，或改选一个已装的版本。"
+    ))
+}
+
+/// 全局安装那一份的版本号（读它的 package.json）。
+pub fn global_version() -> Result<Option<String>, String> {
+    let dir = dsh_package_dir().ok_or_else(|| tr!("未解析到全局 dsh 安装").to_string())?;
+    let txt = std::fs::read_to_string(dir.join("package.json"))
+        .map_err(|e| trf!("读不到 {} 的 package.json: {}", dir.display(), e))?;
+    let doc: serde_json::Value =
+        serde_json::from_str(&txt).map_err(|e| trf!("解析 package.json 失败: {}", e))?;
+    Ok(doc.get("version").and_then(|v| v.as_str()).map(|s| s.to_string()))
+}
+
 /// 全局 dsh 包目录（`…/node_modules/@deepseek-ai/dsh`）。
 ///
 /// 插件页用它区分"DSH 安装自带、随 profile 选择加载"的平台层与用户自己装的插件。
@@ -263,9 +448,24 @@ pub fn dsh_package_dir() -> Option<PathBuf> {
 /// 优先走解析出来的入口（`node <bin.js> plugin …`）而不是 PATH 上的
 /// `dsh.cmd` shim：shim 是批处理、要经 cmd.exe 中转；走入口能保证用的就是
 /// 启动服务的那一份（同一个全局安装）。两者都解析不到时才退回 shim。
-pub fn cli_runner() -> Result<(PathBuf, Vec<String>), String> {
-    if let Ok(e) = resolve_entry() {
+///
+/// [`cli_runner_for`] 的按实例版本：指定实例用哪个版本、哪个实例的目录。
+///
+/// 一定要与跑服务的版本一致：插件装到了 A 版本的 profile、服务却由 B 版本加载，
+/// 就会出现"装了不生效"。
+pub fn cli_runner_for(
+    instance: &str,
+    version: Option<&str>,
+) -> Result<(PathBuf, Vec<String>), String> {
+    if let Ok(e) = resolve_entry_for(instance, version) {
         return Ok((e.node, vec![e.entry.to_string_lossy().into_owned()]));
+    }
+    // 指定了版本却拿不到那份入口 → 不要偷偷退回全局 shim（那是另一个版本）
+    if version.map(|v| !v.trim().is_empty()).unwrap_or(false) {
+        return Err(trf!(
+            "找不到该版本的 dsh 入口。请先在「版本」页把 {} 装给这个实例。",
+            version.unwrap_or("")
+        ));
     }
     if let Some(shim) = which("dsh") {
         return Ok((shim, Vec::new()));
@@ -312,23 +512,34 @@ pub fn global_roots() -> Vec<PathBuf> {
     out
 }
 
-/// 隐藏终端启动 DSH Web 服务。
+/// 隐藏终端启动一个 DSH Web 服务实例。
 ///
-/// 命令：`node <entry> web --host <host> --port <port> --no-open`
-/// - 输出重定向到服务日志（token 会打印在里面）
+/// 命令：`node <entry> <profile> --host <host> --port <port> --no-open`
+/// - 输出重定向到这个实例自己的服务日志（token 会打印在里面）
+/// - `home` 同时作为工作目录与 `DSH_HOME`：多实例各用一份 profile / 插件，
+///   互不干扰（共用一份的话，插件管理命令会同时读写同一个 profiles 目录）
 /// - Windows: CREATE_NO_WINDOW + 命名作业对象；Unix: 自成进程组
-pub fn spawn(entry: &DshEntry, host: &str, port: u16, profile: &str) -> Result<DshInstance, String> {
-    let log_path = config::server_log();
+pub fn spawn_in(
+    entry: &DshEntry,
+    host: &str,
+    port: u16,
+    profile: &str,
+    home: &Path,
+    log_path: &Path,
+) -> Result<DshInstance, String> {
     if let Some(dir) = log_path.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
+    if let Err(e) = std::fs::create_dir_all(home) {
+        return Err(trf!("创建实例目录失败 {}: {}", home.display(), e));
+    }
     // 记录偏移：只解析本次启动之后写入的 token
-    let log_offset = std::fs::metadata(&log_path).map(|m| m.len()).unwrap_or(0);
+    let log_offset = std::fs::metadata(log_path).map(|m| m.len()).unwrap_or(0);
 
     let out = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(&log_path)
+        .open(log_path)
         .map_err(|e| trf!("无法写入服务日志 {}: {}", log_path.display(), e))?;
     let err = out.try_clone().map_err(|e| trf!("日志句柄复制失败: {}", e))?;
 
@@ -347,6 +558,7 @@ pub fn spawn(entry: &DshEntry, host: &str, port: u16, profile: &str) -> Result<D
             entry.entry.display(),
             argline
         );
+        let _ = writeln!(f, "      DSH_HOME={}", home.display());
     }
 
     let mut cmd = Command::new(&entry.node);
@@ -360,7 +572,9 @@ pub fn spawn(entry: &DshEntry, host: &str, port: u16, profile: &str) -> Result<D
         .arg("--port")
         .arg(port.to_string())
         .arg("--no-open")
-        .current_dir(config::home_dir())
+        .current_dir(home)
+        // 子进程认的是 DSH_HOME 环境变量，工作目录只是顺带
+        .env("DSH_HOME", home)
         .stdin(Stdio::null())
         .stdout(Stdio::from(out))
         .stderr(Stdio::from(err));
@@ -378,8 +592,11 @@ pub fn spawn(entry: &DshEntry, host: &str, port: u16, profile: &str) -> Result<D
         .map_err(|e| trf!("启动 DSH 失败（{}）: {}", entry.node.display(), e))?;
     let pid = child.id();
     config::log(&format!(
-        "spawned DSH pid={} via {} [{}]",
-        pid, entry.entry.display(), entry.source
+        "spawned DSH pid={} via {} [{}] home={}",
+        pid,
+        entry.entry.display(),
+        entry.source,
+        home.display()
     ));
 
     // 整树句柄
@@ -391,11 +608,26 @@ pub fn spawn(entry: &DshEntry, host: &str, port: u16, profile: &str) -> Result<D
     Ok(DshInstance { child, pid, kill, log_offset })
 }
 
+/// 单实例时代的入口：用默认 home 与默认日志。
+///
+/// 保留它是给 `--selftest` 用（自检只跑一个实例，走默认路径最直观）。
+pub fn spawn(entry: &DshEntry, host: &str, port: u16, profile: &str) -> Result<DshInstance, String> {
+    spawn_in(entry, host, port, profile, &config::dsh_home(), &config::server_log())
+}
+
 // ---------------------------------------------------------------- token
 
 /// 从服务日志里解析本次运行的 token（只看 `offset` 之后的字节）。
 pub fn latest_token(offset: u64) -> Option<String> {
-    let bytes = std::fs::read(config::server_log()).ok()?;
+    latest_token_at(&config::server_log(), offset)
+}
+
+/// 从**指定**服务日志里解析本次运行的 token。
+///
+/// 多实例必须按实例取自己那份日志：几个实例往同一个文件里写，
+/// "偏移之后第一个 token" 会抓到别人的。
+pub fn latest_token_at(log_path: &Path, offset: u64) -> Option<String> {
+    let bytes = std::fs::read(log_path).ok()?;
     if (offset as usize) >= bytes.len() {
         return None;
     }
@@ -415,9 +647,9 @@ pub fn latest_token(offset: u64) -> Option<String> {
     token
 }
 
-/// 服务日志最后若干行（界面上的诊断区用）。
-pub fn log_tail(lines: usize) -> String {
-    let Ok(bytes) = std::fs::read(config::server_log()) else {
+/// 指定服务日志的最后若干行。
+pub fn log_tail_at(log_path: &Path, lines: usize) -> String {
+    let Ok(bytes) = std::fs::read(log_path) else {
         return String::new();
     };
     let s = String::from_utf8_lossy(&bytes).into_owned();

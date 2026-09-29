@@ -13,6 +13,7 @@ mod config;
 mod dsh;
 mod i18n;
 mod icon;
+mod instances;
 mod plugins;
 mod procs;
 mod selftest;
@@ -25,6 +26,29 @@ mod webui;
 mod winproc;
 
 fn main() {
+    // panic 兜底：GUI 进程没有控制台，默认的 panic 输出谁也看不见——
+    // 用户只会看到"窗口突然没了"，而日志里一片干净，根本无从查起。
+    // 装个 hook 把 panic 与位置写进启动器日志（顺带记下调用栈）。
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let loc = info
+            .location()
+            .map(|l| format!("{}:{}", l.file(), l.line()))
+            .unwrap_or_else(|| "?".to_string());
+        let msg = info
+            .payload()
+            .downcast_ref::<&str>()
+            .map(|s| s.to_string())
+            .or_else(|| info.payload().downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "(非字符串 payload)".to_string());
+        config::log(&format!("PANIC at {}: {}", loc, msg));
+        config::log(&format!(
+            "PANIC backtrace:\n{}",
+            std::backtrace::Backtrace::force_capture()
+        ));
+        default_hook(info);
+    }));
+
     // 诊断模式：不建窗口，只验证「启动 → 就绪 → 拿 token → 整树关闭」这条链路。
     // 用独立端口/独立 DSH_HOME，绝不碰正在使用的会话。
     if std::env::args().any(|a| a == "--selftest" || a == "--diagnose") {

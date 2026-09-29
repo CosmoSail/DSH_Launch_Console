@@ -447,19 +447,19 @@ pub fn filter_local(list: &[PluginInfo], query: &str, category: &str) -> Vec<Plu
 
 // ------------------------------------------------------------------ profile 路径
 
-/// 某个 profile 的目录。
-pub fn profile_dir(profile: &str) -> PathBuf {
-    config::dsh_home().join("profiles").join(profile)
+/// 指定 DSH_HOME 下某个 profile 的目录。
+///
+/// 多实例下没有"全局唯一的 profile 目录"这回事——一定要带上 home。
+pub fn profile_dir_in(home: &Path, profile: &str) -> PathBuf {
+    home.join("profiles").join(profile)
 }
 
-/// profile 的 `cordis.patch.yml`。
-pub fn patch_file(profile: &str) -> PathBuf {
-    profile_dir(profile).join("cordis.patch.yml")
+pub fn patch_file_in(home: &Path, profile: &str) -> PathBuf {
+    profile_dir_in(home, profile).join("cordis.patch.yml")
 }
 
-/// profile 的 `package.json`。
-pub fn profile_package_json(profile: &str) -> PathBuf {
-    profile_dir(profile).join("package.json")
+pub fn profile_package_json_in(home: &Path, profile: &str) -> PathBuf {
+    profile_dir_in(home, profile).join("package.json")
 }
 
 // ------------------------------------------------------------------ 已装插件
@@ -478,9 +478,18 @@ pub struct ScanContext {
 }
 
 impl ScanContext {
-    /// 从运行环境探测。
-    pub fn detect() -> Self {
-        Self { home: config::dsh_home(), install: crate::dsh::dsh_package_dir() }
+    /// 针对**指定实例**的上下文：插件装在哪，取决于这个实例用哪个 DSH_HOME。
+    ///
+    /// `install` 也分两种：实例用具体版本时，平台层就是**这个实例目录里**那个版本的包目录；
+    /// 否则才是全局安装那一份。
+    pub fn detect_for(instance: &str, home: &Path, version: Option<&str>) -> Self {
+        let install = match version.map(|v| v.trim()).filter(|v| !v.is_empty()) {
+            // 指定了版本 → 该实例自装的包目录（装过才算数）
+            Some(v) => crate::dsh::installed_managed_version(instance, v)
+                .and_then(|entry| entry.parent().and_then(|p| p.parent()).map(|p| p.to_path_buf())),
+            None => crate::dsh::dsh_package_dir(),
+        };
+        Self { home: home.to_path_buf(), install }
     }
 
     /// 某个 profile 的目录。
@@ -512,9 +521,68 @@ pub struct ScanReport {
     pub roots: Vec<String>,
 }
 
-/// 扫描某个 profile 的插件（阻塞，读的只是本地文件，很快）。
-pub fn scan(profile: &str) -> ScanReport {
-    scan_with(&ScanContext::detect(), profile)
+// ------------------------------------------------------------------ 按实例操作
+
+/// 针对**某个实例**做插件操作。
+///
+/// 多实例下"插件装在哪"取决于这个实例的 DSH_HOME 与它用的 DSH 版本，
+/// 所以装/卸/启停都不能再用全局默认值。把这些参数收进一个结构体，
+/// 免得每个函数都多挂两三个参数、调用点到处传错。
+#[derive(Debug, Clone)]
+pub struct Ops {
+    /// 这个实例的 id（用来定位它自己的版本目录）
+    pub instance: String,
+    /// 这个实例的 profile
+    pub profile: String,
+    /// 这个实例的 DSH_HOME
+    pub home: PathBuf,
+    /// 这个实例用的 DSH 版本（空 = 全局安装那一份）
+    pub version: Option<String>,
+}
+
+impl Ops {
+    pub fn new(instance: &str, profile: &str, home: &Path, version: Option<&str>) -> Self {
+        Self {
+            instance: instance.to_string(),
+            profile: profile.to_string(),
+            home: home.to_path_buf(),
+            version: version.map(|s| s.to_string()),
+        }
+    }
+
+    fn ctx(&self) -> ScanContext {
+        ScanContext::detect_for(&self.instance, &self.home, self.version.as_deref())
+    }
+
+    /// 扫这个实例已装了哪些插件（阻塞，只读本地文件，毫秒级）。
+    pub fn scan(&self) -> ScanReport {
+        scan_with(&self.ctx(), &self.profile)
+    }
+
+    /// 这个实例的 `cordis.patch.yml`。
+    pub fn patch_path(&self) -> PathBuf {
+        patch_file_in(&self.home, &self.profile)
+    }
+
+    pub fn install(&self, spec: &str) -> Result<String, String> {
+        install_in(&self.instance, &self.home, &self.profile, self.version.as_deref(), spec)
+    }
+
+    pub fn uninstall(&self, spec: &str) -> Result<String, String> {
+        uninstall_in(&self.instance, &self.home, &self.profile, self.version.as_deref(), spec)
+    }
+
+    pub fn update_to_latest(&self, package: &str) -> Result<String, String> {
+        self.install(&format!("{}@latest", package))
+    }
+
+    pub fn installed_version(&self, package: &str) -> Option<String> {
+        installed_version_in(&self.instance, &self.home, self.version.as_deref(), &self.profile, package)
+    }
+
+    pub fn toggle_ids(&self, ids: &[String], enabled: bool) -> Result<(), String> {
+        toggle_ids_at(&self.patch_path(), ids, enabled)
+    }
 }
 
 /// 核心：把 profile 里**所有**能发现插件的途径合并成一份列表。
@@ -547,7 +615,7 @@ pub fn scan_with(ctx: &ScanContext, profile: &str) -> ScanReport {
         rep.warnings.push(trf!("profile 目录不存在：{}", dir.display()));
     } else if doc.is_none() {
         rep.warnings
-            .push(trf!("读不到或解析不了 {}", profile_package_json(profile).display()));
+            .push(trf!("读不到或解析不了 {}", profile_package_json_in(&ctx.home, profile).display()));
     }
     let deps = dep_map(doc.as_ref());
     let bundles = bundle_list(doc.as_ref());
@@ -1056,34 +1124,61 @@ fn preflight_pnpm() -> Result<(), String> {
 
 /// 用 DSH 自带的插件命令安装（走 pnpm，与 dsh-market 相同的路径）。
 ///
-/// 执行的是**全局安装**那一份 dsh——与启动服务、与服务端加载插件的是同一份。
-pub fn install(profile: &str, spec: &str) -> Result<String, String> {
+/// 执行的是**这个实例用的**那一份 dsh——与服务端加载插件的必须是同一份，
+/// 否则插件装到了 A 版本、服务却由 B 版本加载。
+pub fn install_in(
+    instance: &str,
+    home: &Path,
+    profile: &str,
+    version: Option<&str>,
+    spec: &str,
+) -> Result<String, String> {
     preflight_pnpm()?;
-    let (program, prefix) = crate::dsh::cli_runner()?;
-    let mut argv: Vec<String> = prefix;
-    argv.extend(
-        ["plugin", "--profile", profile, "add", spec].iter().map(|s| s.to_string()),
-    );
+    let (program, prefix) = crate::dsh::cli_runner_for(instance, version)?;
+    plugin_cmd(&program, &prefix, home, profile, "add", spec)
+}
+
+/// 拼 `dsh plugin --profile <p> add|remove <spec>` 并执行。
+///
+/// `home` 通过 `DSH_HOME` 传给子进程：插件是装到那个 home 的 profile 里的，
+/// 不传的话会装到全局 `~/.dsh`——多实例下就串了。
+fn plugin_cmd(
+    program: &Path,
+    prefix: &[String],
+    home: &Path,
+    profile: &str,
+    verb: &str,
+    spec: &str,
+) -> Result<String, String> {
+    let mut argv: Vec<String> = prefix.to_vec();
+    argv.extend(["plugin", "--profile", profile, verb, spec].iter().map(|s| s.to_string()));
     let args: Vec<&str> = argv.iter().map(|s| s.as_str()).collect();
-    let (ok, text) = procs::run_capture(&program, &args, None)?;
+    let (ok, text) = procs::run_capture_env(program, &args, Some(home), &[("DSH_HOME", home)])?;
     if ok {
         Ok(text)
     } else {
-        Err(trf!("安装失败：\n{}\n\n可手动执行：\ndsh plugin --profile {} add {}", text, profile, spec))
+        Err(trf!(
+            "安装/卸载失败：\n{}\n\n可手动执行（注意带上 DSH_HOME）：\ndsh plugin --profile {} {} {}",
+            text,
+            profile,
+            verb,
+            spec
+        ))
     }
-}
-
-/// 把插件更新到最新版（等价于 `dsh plugin --profile <p> add <包名>@latest`）。
-pub fn update_to_latest(profile: &str, package: &str) -> Result<String, String> {
-    install(profile, &format!("{}@latest", package))
 }
 
 /// 某个包当前装在 profile 里的版本（读磁盘上的 package.json）。
 ///
 /// 更新完用它回报"实际装到了哪一版"——npm 的 `latest` 与 pnpm 真正落盘的版本
 /// 可能差一档（pnpm 有最小发布年龄策略），照实说比复述请求值有用。
-pub fn installed_version(profile: &str, package: &str) -> Option<String> {
-    let ctx = ScanContext::detect();
+pub fn installed_version_in(
+    instance: &str,
+    home: &Path,
+    version: Option<&str>,
+    profile: &str,
+    package: &str,
+) -> Option<String> {
+    let ctx = ScanContext::detect_for(instance, home, version);
     let (dir, _) = resolve_package(&ctx, profile, package)?;
     read_json(&dir.join("package.json"))?
         .get("version")
@@ -1139,25 +1234,18 @@ pub fn fetch_latest(names: &[String]) -> (BTreeMap<String, String>, Vec<String>)
 }
 
 /// 卸载插件。
-pub fn uninstall(profile: &str, spec: &str) -> Result<String, String> {
+///
+/// 与 `install_in` 配对，调用方通常是 [`Ops::uninstall`]。
+pub fn uninstall_in(
+    instance: &str,
+    home: &Path,
+    profile: &str,
+    version: Option<&str>,
+    spec: &str,
+) -> Result<String, String> {
     preflight_pnpm()?;
-    let (program, prefix) = crate::dsh::cli_runner()?;
-    let mut argv: Vec<String> = prefix;
-    argv.extend(
-        ["plugin", "--profile", profile, "remove", spec].iter().map(|s| s.to_string()),
-    );
-    let args: Vec<&str> = argv.iter().map(|s| s.as_str()).collect();
-    let (ok, text) = procs::run_capture(&program, &args, None)?;
-    if ok {
-        Ok(text)
-    } else {
-        Err(trf!("卸载失败：\n{}", text))
-    }
-}
-
-/// 把「启用/禁用」写回 profile 的 cordis.patch.yml。
-pub fn toggle_ids(profile: &str, ids: &[String], enabled: bool) -> Result<(), String> {
-    toggle_ids_at(&patch_file(profile), ids, enabled)
+    let (program, prefix) = crate::dsh::cli_runner_for(instance, version)?;
+    plugin_cmd(&program, &prefix, home, profile, "remove", spec)
 }
 
 /// `toggle_ids` 的落地版本：直接对某个 `cordis.patch.yml` 生效（便于测试）。
@@ -1538,11 +1626,17 @@ mod tests {
     }
 
     /// 真实 DSH_HOME 冒烟（只读）：`cargo test -- --ignored --nocapture`
+    ///
+    /// 可选 `DSH_LAUNCH_CONSOLE_VERSION` / `DSH_LAUNCH_CONSOLE_INSTANCE` 指定版本与实例，
+    /// 验证按实例扫描。
     #[test]
     #[ignore = "读真实 DSH_HOME，人工跑：cargo test -- --ignored --nocapture"]
     fn scan_real_home_smoke() {
-        let ctx = ScanContext::detect();
         let profile = std::env::var("DSH_LAUNCH_CONSOLE_PROFILE").unwrap_or_else(|_| "web".into());
+        let version = std::env::var("DSH_LAUNCH_CONSOLE_VERSION").ok();
+        let instance = std::env::var("DSH_LAUNCH_CONSOLE_INSTANCE")
+            .unwrap_or_else(|_| crate::settings::GLOBAL_ID.to_string());
+        let ctx = ScanContext::detect_for(&instance, &config::dsh_home(), version.as_deref());
         let rep = scan_with(&ctx, &profile);
         println!("home={:?} install={:?}", ctx.home, ctx.install);
         println!("roots: {:#?}", rep.roots);
